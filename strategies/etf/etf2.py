@@ -100,8 +100,9 @@ def initialize(context):
     g.max_days = MAX_LOOKBACK
 
     # 事件驱动调仓状态
-    g.last_rebalance_day = -MAX_HOLD_DAYS  # 上次调仓的交易日序号
-    g.peak_value = context.portfolio.total_value  # 组合历史最高净值
+    g.last_rebalance_date = None   # 上次调仓日期
+    g.skip_count = 0               # 连续无操作次数（交易日计数）
+    g.peak_value = None            # 组合历史最高净值（惰性初始化）
 
     log.info(f"策略参数: 持有{g.target_num}只, 动态回看={'开' if g.auto_day else '关'}"
              f"({g.min_days}~{g.max_days})")
@@ -117,6 +118,9 @@ def _calc_score(prices):
     使用加权线性回归（权重从1线性递增到2，近期权重大），
     斜率转换为年化收益率，R²衡量趋势可靠性。
     """
+    if len(prices) < 4:
+        return 0
+
     y = np.log(prices)
     x = np.arange(len(y))
     weights = np.linspace(1, 2, len(y))
@@ -145,7 +149,7 @@ def _ranked_scores(scores):
 
 
 def get_rank(etf_pool):
-    """固定回看期动量评分"""
+    """固定回看期动量评分，返回 (etf_list, score_list, score_map)"""
     scores = {}
     current_data = get_current_data()
     for etf in etf_pool:
@@ -153,11 +157,12 @@ def get_rank(etf_pool):
         prices = np.append(df["close"].values, current_data[etf].last_price)
         scores[etf] = _calc_score(prices)
 
-    return _ranked_scores(scores)
+    etf_list, score_list = _ranked_scores(scores)
+    return etf_list, score_list, scores
 
 
 def get_rank2(etf_pool):
-    """ATR动态回看期动量评分"""
+    """ATR动态回看期动量评分，返回 (etf_list, score_list, score_map)"""
     scores = {}
     current_data = get_current_data()
     for etf in etf_pool:
@@ -180,25 +185,26 @@ def get_rank2(etf_pool):
 
         scores[etf] = _calc_score(prices)
 
-    return _ranked_scores(scores)
+    etf_list, score_list = _ranked_scores(scores)
+    return etf_list, score_list, scores
 
 
-def _compute_target(context):
-    """计算目标持仓列表和权重，返回 (etf_list, score_list, weights)"""
+def _compute_target():
+    """计算目标持仓列表和权重，返回 (etf_list, score_list, weights, score_map)"""
     if g.auto_day:
-        etf_list, score_list = get_rank2(g.etf_pool)
+        etf_list, score_list, score_map = get_rank2(g.etf_pool)
     else:
-        etf_list, score_list = get_rank(g.etf_pool)
+        etf_list, score_list, score_map = get_rank(g.etf_pool)
 
     etf_list = etf_list[:g.target_num]
     score_list = score_list[:g.target_num]
 
     if not etf_list:
-        return [], [], []
+        return [], [], [], {}
 
     total_score = sum(score_list)
     weights = [s / total_score for s in score_list]
-    return etf_list, score_list, weights
+    return etf_list, score_list, weights, score_map
 
 
 def _check_drawdown_stop(context):
@@ -207,6 +213,9 @@ def _check_drawdown_stop(context):
         return False
 
     current_value = context.portfolio.total_value
+    if g.peak_value is None:
+        g.peak_value = current_value
+
     g.peak_value = max(g.peak_value, current_value)
     drawdown = 1 - current_value / g.peak_value
 
@@ -214,7 +223,7 @@ def _check_drawdown_stop(context):
         log.info(f"⚠ 组合回撤止损: 回撤{drawdown:.1%} >= {MAX_DRAWDOWN_STOP:.1%}，清仓")
         for etf in list(context.portfolio.positions):
             order_target_value(etf, 0)
-        g.peak_value = current_value  # 重置峰值，避免反复触发
+        g.peak_value = current_value
         return True
     return False
 
@@ -239,31 +248,20 @@ def _check_momentum_crash(context, target_etfs, target_scores):
     return False
 
 
-def _need_replace(context, target_etfs, target_scores):
+def _need_replace(context, target_etfs, score_map):
     """标的替换触发：新标的得分需显著超过当前最弱持仓才换仓"""
     holds = list(context.portfolio.positions)
     if not holds:
-        return True  # 空仓必须建仓
+        return True
 
-    # 持仓完全一致，无需替换
     if set(holds) == set(target_etfs):
         return False
 
-    # 有标的需要卖出（不在目标列表中），检查是否值得换
     leaving = [etf for etf in holds if etf not in target_etfs]
     if not leaving:
-        return True  # 只需新增标的，无需替换判断
+        return True
 
-    # 获取当前持仓标的的得分
-    if g.auto_day:
-        all_etfs, all_scores = get_rank2(g.etf_pool)
-    else:
-        all_etfs, all_scores = get_rank(g.etf_pool)
-    score_map = dict(zip(all_etfs, all_scores))
-
-    # 当前最弱持仓的得分
     weakest_hold_score = min(score_map.get(etf, 0) for etf in leaving)
-    # 即将新进入的最强标的得分
     entering = [etf for etf in target_etfs if etf not in holds]
     if not entering:
         return True
@@ -284,12 +282,16 @@ def _need_rebalance(context, target_etfs, target_weights):
         return False
 
     for etf, target_w in zip(target_etfs, target_weights):
-        current_value = context.portfolio.positions[etf].total_amount * \
-                        context.portfolio.positions[etf].avg_cost if etf in context.portfolio.positions else 0
+        if etf in context.portfolio.positions:
+            current_value = context.portfolio.positions[etf].value
+        else:
+            current_value = 0
         current_w = current_value / total_value
         if abs(current_w - target_w) > DRIFT_THRESHOLD:
             return True
     return False
+
+
 
 
 def check_and_trade(context):
@@ -299,26 +301,31 @@ def check_and_trade(context):
         return
 
     # 2. 计算目标持仓
-    target_etfs, target_scores, target_weights = _compute_target(context)
+    target_etfs, target_scores, target_weights, score_map = _compute_target()
     if not target_etfs:
         log.info("无合格标的，维持当前持仓")
         return
 
     # 3. 动量崩溃止损
     if _check_momentum_crash(context, target_etfs, target_scores):
-        # 止损后重新计算目标
-        target_etfs, target_scores, target_weights = _compute_target(context)
+        target_etfs, target_scores, target_weights, score_map = _compute_target()
         if not target_etfs:
             return
 
     # 4. 判断是否需要调仓
-    days_since_rebalance = context.trading_day_index - g.last_rebalance_day
+    today = context.current_dt.date()
+    if g.last_rebalance_date is None:
+        days_since_rebalance = MAX_HOLD_DAYS  # 首日强制触发
+    else:
+        days_since_rebalance = (today - g.last_rebalance_date).days
+        # 自然日差 × 0.7 ≈ 交易日数（保守估计）
+        days_since_rebalance = int(days_since_rebalance * 0.7)
+
     holds = list(context.portfolio.positions)
     is_empty = len(holds) == 0
 
-    # 触发条件：空仓建仓 / 标的替换 / 权重漂移 / 最长持仓天数兜底
     should_rebalance = is_empty \
-        or _need_replace(context, target_etfs, target_scores) \
+        or _need_replace(context, target_etfs, score_map) \
         or _need_rebalance(context, target_etfs, target_weights) \
         or days_since_rebalance >= MAX_HOLD_DAYS
 
@@ -328,18 +335,16 @@ def check_and_trade(context):
     # 5. 执行调仓
     log.info(f"🔄 调仓触发 (空仓={is_empty}, 距上次={days_since_rebalance}天)")
 
-    # 卖出不在目标列表中的持仓
     for etf in holds:
         if etf not in target_etfs:
             order_target_value(etf, 0)
             log.info(f"  卖出 {etf}")
 
-    # 按动量强度比例建仓/调仓
     for etf, weight in zip(target_etfs, target_weights):
         target_value = context.portfolio.total_value * weight
         order_target_value(etf, target_value)
 
-    g.last_rebalance_day = context.trading_day_index
+    g.last_rebalance_date = today
     log.info("  " + " | ".join(
         f"{etf} {w:.0%}" for etf, w in zip(target_etfs, target_weights)
     ))
