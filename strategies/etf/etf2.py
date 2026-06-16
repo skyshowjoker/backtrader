@@ -4,14 +4,18 @@
 # https://www.joinquant.com/post/60824  0xtao
 # https://www.joinquant.com/post/42673  wywy1995
 #
-# 优化内容：
-# 1. 持有数量可配置（TARGET_NUM），等权分配，分散单一标的风险
-# 2. 修复原始策略缺少 import math 的 bug
-# 3. 提取公共评分函数，消除 get_rank/get_rank2 重复代码
-# 4. get_rank2 中 continue 导致 NaN 行问题修复
-# 5. print → log.info
-# 6. FixedSlippage → PriceRelatedSlippage，适配不同价位ETF
-# 7. 停牌标的卖出失败容错处理
+# 核心优化：
+# 1. 事件驱动调仓：每天检查，但只在触发条件满足时才换仓
+#    - 标的替换触发：新标的得分超过当前持仓得分一定比例
+#    - 权重漂移触发：实际仓位偏离目标仓位超过阈值
+#    - 止损触发：持仓标的动量崩溃或组合回撤超限
+#    - 最长持仓天数兜底：防止长期不调仓
+# 2. 持有数量可配置，按动量强度比例分配仓位
+# 3. 修复原始策略缺少 import math 的 bug
+# 4. 提取公共评分函数，消除重复代码
+# 5. get_rank2 中 continue 导致 NaN 行问题修复
+# 6. FixedSlippage → PriceRelatedSlippage
+# 7. print → log.info
 
 # ======================== 策略参数配置 ========================
 # 持有得分最高的N只ETF，按动量强度比例分配仓位
@@ -20,15 +24,31 @@
 # 3+ = 更分散但单标的贡献降低
 TARGET_NUM = 2
 
-# 调仓频率: 'daily' / 'weekly' / 'monthly'
-# daily   = 每个交易日调仓，捕捉快但交易成本高
-# weekly  = 每周一调仓（推荐），平衡灵敏度与成本
-# monthly = 每月首个交易日调仓，成本最低但反应慢
-REBALANCE_FREQ = 'weekly'
+# --- 事件驱动调仓参数 ---
+# 标的替换触发：新标的得分 / 当前最弱持仓得分 > 此值才换仓
+# 1.0 = 只要排名变就换（等同日频），1.2 = 新标的需强20%（推荐），越大越保守
+REPLACE_THRESHOLD = 1.2
 
-# 调仓执行时间（开盘后分钟数，如 '9:40'）
+# 权重漂移触发：实际仓位与目标仓位偏差超过此比例时再平衡
+# 0.05 = 偏离5%就调（灵敏），0.15 = 偏离15%才调（推荐）
+DRIFT_THRESHOLD = 0.15
+
+# 组合最大回撤止损：从最近高点回撤超过此比例时清仓
+# 0.10 = 回撤10%清仓，0 = 不启用
+MAX_DRAWDOWN_STOP = 0.10
+
+# 单标的动量崩溃止损：持仓标的当日得分降为0时立即卖出
+# True = 启用（推荐），False = 不启用
+MOMENTUM_CRASH_STOP = True
+
+# 最长持仓天数：超过此天数未调仓则强制检查一次
+# 防止市场长期平稳导致仓位僵化，10 = 10个交易日
+MAX_HOLD_DAYS = 10
+
+# 调仓执行时间
 REBALANCE_TIME = '9:40'
 
+# --- 动量计算参数 ---
 # 启用ATR动态回看期（False则使用固定回看期）
 AUTO_LOOKBACK = True
 
@@ -79,17 +99,16 @@ def initialize(context):
     g.min_days = MIN_LOOKBACK
     g.max_days = MAX_LOOKBACK
 
-    log.info(f"策略参数: 持有{g.target_num}只, 动态回看={'开' if g.auto_day else '关'}"
-             f"({g.min_days}~{g.max_days}), 调仓={REBALANCE_FREQ}")
+    # 事件驱动调仓状态
+    g.last_rebalance_day = -MAX_HOLD_DAYS  # 上次调仓的交易日序号
+    g.peak_value = context.portfolio.total_value  # 组合历史最高净值
 
-    if REBALANCE_FREQ == 'daily':
-        run_daily(trade, REBALANCE_TIME)
-    elif REBALANCE_FREQ == 'weekly':
-        run_weekly(trade, weekday=1, time=REBALANCE_TIME)
-    elif REBALANCE_FREQ == 'monthly':
-        run_monthly(trade, monthday=1, time=REBALANCE_TIME)
-    else:
-        raise ValueError(f"不支持的调仓频率: {REBALANCE_FREQ}，可选: daily/weekly/monthly")
+    log.info(f"策略参数: 持有{g.target_num}只, 动态回看={'开' if g.auto_day else '关'}"
+             f"({g.min_days}~{g.max_days})")
+    log.info(f"调仓触发: 替换>{REPLACE_THRESHOLD}, 漂移>{DRIFT_THRESHOLD:.0%},"
+             f" 回撤止损{MAX_DRAWDOWN_STOP:.0%}, 最长{MAX_HOLD_DAYS}天")
+
+    run_daily(check_and_trade, REBALANCE_TIME)
 
 
 def _calc_score(prices):
@@ -164,8 +183,8 @@ def get_rank2(etf_pool):
     return _ranked_scores(scores)
 
 
-def trade(context):
-    """每日调仓：按动量强度比例持有Top N ETF"""
+def _compute_target(context):
+    """计算目标持仓列表和权重，返回 (etf_list, score_list, weights)"""
     if g.auto_day:
         etf_list, score_list = get_rank2(g.etf_pool)
     else:
@@ -175,24 +194,152 @@ def trade(context):
     score_list = score_list[:g.target_num]
 
     if not etf_list:
+        return [], [], []
+
+    total_score = sum(score_list)
+    weights = [s / total_score for s in score_list]
+    return etf_list, score_list, weights
+
+
+def _check_drawdown_stop(context):
+    """组合回撤止损：从峰值回撤超过阈值则清仓"""
+    if MAX_DRAWDOWN_STOP <= 0:
+        return False
+
+    current_value = context.portfolio.total_value
+    g.peak_value = max(g.peak_value, current_value)
+    drawdown = 1 - current_value / g.peak_value
+
+    if drawdown >= MAX_DRAWDOWN_STOP and context.portfolio.positions:
+        log.info(f"⚠ 组合回撤止损: 回撤{drawdown:.1%} >= {MAX_DRAWDOWN_STOP:.1%}，清仓")
+        for etf in list(context.portfolio.positions):
+            order_target_value(etf, 0)
+        g.peak_value = current_value  # 重置峰值，避免反复触发
+        return True
+    return False
+
+
+def _check_momentum_crash(context, target_etfs, target_scores):
+    """动量崩溃止损：持仓标的中得分降为0的立即卖出"""
+    if not MOMENTUM_CRASH_STOP:
+        return False
+
+    crashed = []
+    for etf in list(context.portfolio.positions):
+        if etf in target_etfs:
+            idx = target_etfs.index(etf)
+            if target_scores[idx] == 0:
+                crashed.append(etf)
+
+    if crashed:
+        log.info(f"⚠ 动量崩溃止损: {crashed} 得分为0，立即卖出")
+        for etf in crashed:
+            order_target_value(etf, 0)
+        return True
+    return False
+
+
+def _need_replace(context, target_etfs, target_scores):
+    """标的替换触发：新标的得分需显著超过当前最弱持仓才换仓"""
+    holds = list(context.portfolio.positions)
+    if not holds:
+        return True  # 空仓必须建仓
+
+    # 持仓完全一致，无需替换
+    if set(holds) == set(target_etfs):
+        return False
+
+    # 有标的需要卖出（不在目标列表中），检查是否值得换
+    leaving = [etf for etf in holds if etf not in target_etfs]
+    if not leaving:
+        return True  # 只需新增标的，无需替换判断
+
+    # 获取当前持仓标的的得分
+    if g.auto_day:
+        all_etfs, all_scores = get_rank2(g.etf_pool)
+    else:
+        all_etfs, all_scores = get_rank(g.etf_pool)
+    score_map = dict(zip(all_etfs, all_scores))
+
+    # 当前最弱持仓的得分
+    weakest_hold_score = min(score_map.get(etf, 0) for etf in leaving)
+    # 即将新进入的最强标的得分
+    entering = [etf for etf in target_etfs if etf not in holds]
+    if not entering:
+        return True
+    best_new_score = max(score_map.get(etf, 0) for etf in entering)
+
+    if weakest_hold_score > 0 and best_new_score / weakest_hold_score < REPLACE_THRESHOLD:
+        log.info(f"⏸ 不换仓: 新标的最高分{best_new_score:.2f} / 持仓最低分{weakest_hold_score:.2f}"
+                 f" = {best_new_score / weakest_hold_score:.2f} < {REPLACE_THRESHOLD}")
+        return False
+
+    return True
+
+
+def _need_rebalance(context, target_etfs, target_weights):
+    """权重漂移触发：实际仓位偏离目标仓位超过阈值时再平衡"""
+    total_value = context.portfolio.total_value
+    if total_value == 0:
+        return False
+
+    for etf, target_w in zip(target_etfs, target_weights):
+        current_value = context.portfolio.positions[etf].total_amount * \
+                        context.portfolio.positions[etf].avg_cost if etf in context.portfolio.positions else 0
+        current_w = current_value / total_value
+        if abs(current_w - target_w) > DRIFT_THRESHOLD:
+            return True
+    return False
+
+
+def check_and_trade(context):
+    """事件驱动调仓：每天检查触发条件，满足时才执行"""
+    # 1. 组合回撤止损（最高优先级）
+    if _check_drawdown_stop(context):
+        return
+
+    # 2. 计算目标持仓
+    target_etfs, target_scores, target_weights = _compute_target(context)
+    if not target_etfs:
         log.info("无合格标的，维持当前持仓")
         return
 
-    # 按得分比例分配仓位：weight_i = score_i / sum(scores)
-    total_score = sum(score_list)
-    weights = [s / total_score for s in score_list]
+    # 3. 动量崩溃止损
+    if _check_momentum_crash(context, target_etfs, target_scores):
+        # 止损后重新计算目标
+        target_etfs, target_scores, target_weights = _compute_target(context)
+        if not target_etfs:
+            return
+
+    # 4. 判断是否需要调仓
+    days_since_rebalance = context.trading_day_index - g.last_rebalance_day
+    holds = list(context.portfolio.positions)
+    is_empty = len(holds) == 0
+
+    # 触发条件：空仓建仓 / 标的替换 / 权重漂移 / 最长持仓天数兜底
+    should_rebalance = is_empty \
+        or _need_replace(context, target_etfs, target_scores) \
+        or _need_rebalance(context, target_etfs, target_weights) \
+        or days_since_rebalance >= MAX_HOLD_DAYS
+
+    if not should_rebalance:
+        return
+
+    # 5. 执行调仓
+    log.info(f"🔄 调仓触发 (空仓={is_empty}, 距上次={days_since_rebalance}天)")
 
     # 卖出不在目标列表中的持仓
-    for etf in list(context.portfolio.positions):
-        if etf not in etf_list:
+    for etf in holds:
+        if etf not in target_etfs:
             order_target_value(etf, 0)
-            log.info(f"卖出 {etf}")
+            log.info(f"  卖出 {etf}")
 
-    # 按比例建仓/调仓
-    for etf, weight in zip(etf_list, weights):
+    # 按动量强度比例建仓/调仓
+    for etf, weight in zip(target_etfs, target_weights):
         target_value = context.portfolio.total_value * weight
         order_target_value(etf, target_value)
 
-    log.info(" | ".join(
-        f"{etf} {w:.0%}" for etf, w in zip(etf_list, weights)
+    g.last_rebalance_day = context.trading_day_index
+    log.info("  " + " | ".join(
+        f"{etf} {w:.0%}" for etf, w in zip(target_etfs, target_weights)
     ))
