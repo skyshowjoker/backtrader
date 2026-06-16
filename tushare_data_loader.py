@@ -37,17 +37,51 @@ class TushareParquetData(bt.feeds.PandasData):
 
 
 class TushareDataLoader:
-    """Tushare 数据加载器"""
+    """Tushare 数据加载器 (优化版 - 支持缓存)"""
 
-    def __init__(self, data_path='/Users/mac/Downloads/行情数据'):
+    def __init__(self, data_path=None, use_cache=True):
         """
         初始化数据加载器
 
         Args:
             data_path: 数据文件夹路径
+            use_cache: 是否启用缓存（默认启用）
         """
+        if data_path is None:
+            data_path = r'C:\Users\perlicue\Documents\开发文档\stock_data\行情数据'
         self.data_path = data_path
         self.daily_file = os.path.join(data_path, 'stock_daily.parquet')
+        self.use_cache = use_cache
+        self._daily_cache = None  # 日线数据缓存
+        self._cache_stats = {'hits': 0, 'misses': 0}  # 缓存统计
+
+    def _get_daily_df(self):
+        """
+        获取日线数据DataFrame（带缓存）
+
+        Returns:
+            DataFrame: 日线数据
+        """
+        if self.use_cache and self._daily_cache is not None:
+            self._cache_stats['hits'] += 1
+            return self._daily_cache
+
+        self._cache_stats['misses'] += 1
+        df = pd.read_parquet(self.daily_file)
+
+        if self.use_cache:
+            self._daily_cache = df
+
+        return df
+
+    def get_cache_stats(self):
+        """获取缓存统计信息"""
+        return self._cache_stats.copy()
+
+    def clear_cache(self):
+        """清除缓存"""
+        self._daily_cache = None
+        self._cache_stats = {'hits': 0, 'misses': 0}
 
     def load_daily_data(self, ts_code, start_date=None, end_date=None,
                        adj_type='hfq', preload=True):
@@ -59,17 +93,13 @@ class TushareDataLoader:
             start_date: 开始日期,str或datetime,如 '20200101' 或 datetime(2020,1,1)
             end_date: 结束日期
             adj_type: 复权类型,'hfq'(后复权),'qfq'(前复权),'none'(不复权)
-            preload: 是否预加载整个文件
+            preload: 是否预加载整个文件（已废弃，使用缓存替代）
 
         Returns:
             PandasData 对象
         """
-        # 读取数据
-        if preload:
-            df = pd.read_parquet(self.daily_file)
-        else:
-            # 如果内存不够,可以分块读取
-            df = pd.read_parquet(self.daily_file)
+        # 使用缓存读取数据
+        df = self._get_daily_df()
 
         # 筛选指定股票
         df = df.xs(ts_code, level='ts_code')

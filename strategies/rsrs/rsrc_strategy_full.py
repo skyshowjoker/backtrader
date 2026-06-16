@@ -15,20 +15,26 @@ RSRS价值选股策略 - 完整深度复刻版
 import backtrader as bt
 import pandas as pd
 import numpy as np
-import statsmodels.api as sm
+import os
 from datetime import datetime, timedelta
+from collections import deque
 from tushare_data_loader import TushareDataLoader
 
 
 class RSRSIndicatorFull(bt.Indicator):
     """
-    RSRS指标 - 完整实现版
+    RSRS指标 - 完整实现版（优化版 - 向量化计算）
     阻力支撑相对强度指标 (Resistance Support Relative Strength)
 
     核心逻辑：
     1. 对过去N天的高低价进行OLS回归: high = alpha + beta * low
     2. 计算beta序列的标准化z-score
     3. 使用R²进行右偏修正
+
+    优化点：
+    - 使用deque限制内存增长
+    - 手动实现OLS公式，避免statsmodels开销
+    - 向量化计算，提升性能
     """
 
     lines = ('zscore', 'zscore_rightdev', 'beta', 'r2')
@@ -39,25 +45,48 @@ class RSRSIndicatorFull(bt.Indicator):
     )
 
     def __init__(self):
-        # 存储历史beta值
-        self.beta_history = []
-        self.r2_history = []
+        # 使用deque存储历史beta值，限制最大长度避免内存无限增长
+        self.beta_history = deque(maxlen=self.p.sample + 100)
+        self.r2_history = deque(maxlen=self.p.sample + 100)
 
         # 需要足够的数据才能计算
         self.addminperiod(self.p.period)
 
     def next(self):
-        # 获取过去N天的高低价格
-        highs = np.array([self.data.high[-i] for i in range(self.p.period)])
-        lows = np.array([self.data.low[-i] for i in range(self.p.period)])
+        """
+        计算RSRS指标 - 向量化优化版
+        """
+        # 向量化获取历史数据，避免循环
+        highs = np.array(self.data.high.get(ago=0, size=self.p.period))
+        lows = np.array(self.data.low.get(ago=0, size=self.p.period))
 
-        # OLS回归: high = alpha + beta * low
-        X = sm.add_constant(lows)
-        model = sm.OLS(highs, X)
-        results = model.fit()
+        # 手动实现OLS回归，避免statsmodels开销
+        # 公式: beta = Cov(high, low) / Var(low)
+        #       alpha = mean(high) - beta * mean(low)
+        n = len(lows)
 
-        beta = results.params[1]  # 斜率
-        r2 = results.rsquared      # R²决定系数
+        # 计算均值
+        mean_low = np.mean(lows)
+        mean_high = np.mean(highs)
+
+        # 计算协方差和方差（向量化）
+        cov_low_high = np.sum((lows - mean_low) * (highs - mean_high)) / n
+        var_low = np.sum((lows - mean_low) ** 2) / n
+
+        # 计算beta和alpha
+        if var_low == 0:
+            beta = 0
+            alpha = mean_high
+        else:
+            beta = cov_low_high / var_low
+            alpha = mean_high - beta * mean_low
+
+        # 计算R²决定系数
+        # R² = 1 - SS_res / SS_tot
+        y_pred = alpha + beta * lows
+        ss_res = np.sum((highs - y_pred) ** 2)
+        ss_tot = np.sum((highs - mean_high) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
 
         # 保存历史数据
         self.beta_history.append(beta)
@@ -74,17 +103,17 @@ class RSRSIndicatorFull(bt.Indicator):
             self.lines.zscore_rightdev[0] = 0
             return
 
-        # 取最近M个beta值
-        section = self.beta_history[-self.p.sample:]
+        # 取最近M个beta值（向量化计算）
+        beta_section = np.array(list(self.beta_history)[-self.p.sample:])
 
         # 计算标准化的RSRS指标
-        mu = np.mean(section)
-        sigma = np.std(section)
+        mu = np.mean(beta_section)
+        sigma = np.std(beta_section)
 
         if sigma == 0:
             zscore = 0
         else:
-            zscore = (section[-1] - mu) / sigma
+            zscore = (beta_section[-1] - mu) / sigma
 
         # 计算右偏RSRS标准分 = zscore * beta * r2
         zscore_rightdev = zscore * beta * r2
@@ -96,7 +125,7 @@ class RSRSIndicatorFull(bt.Indicator):
 
 class ValueStockSelector:
     """
-    价值选股器 - 完整实现版
+    价值选股器 - 完整实现版（优化版 - 支持缓存）
 
     选股逻辑：
     1. 获取所有股票的PB和PE数据
@@ -104,15 +133,72 @@ class ValueStockSelector:
     3. 排序：按PB升序排列
     4. 打分：score = rank(PB) + rank(1/PE)  # PE越低越好，相当于ROE越高越好
     5. 选股：选择得分最低的N只股票
+
+    优化点：
+    - 添加数据缓存，避免重复读取parquet
+    - 添加结果缓存，同一天不重复计算
     """
 
-    def __init__(self, data_path='/Users/mac/Downloads/行情数据'):
-        self.data_path = data_path
-        self.daily_file = data_path + '/stock_daily.parquet'
+    def __init__(self, data_loader=None, data_path=None, use_cache=True):
+        self.use_cache = use_cache
+
+        # 数据缓存
+        self._daily_cache = None
+
+        # 结果缓存（避免同一天重复计算）
+        self._last_date = None
+        self._last_pool = None
+
+        # 缓存统计
+        self._cache_stats = {'data_hits': 0, 'data_misses': 0, 'result_hits': 0}
+
+        # 支持共享数据加载器（避免重复缓存）
+        if data_loader is not None:
+            self.loader = data_loader
+            self.data_path = data_loader.data_path
+            self.daily_file = data_loader.daily_file
+            self._shared_loader = True
+        else:
+            # 默认数据路径
+            if data_path is None:
+                data_path = r'C:\Users\perlicue\Documents\开发文档\stock_data\行情数据'
+            self.data_path = data_path
+            self.daily_file = os.path.join(data_path, 'stock_daily.parquet')
+            self.loader = None
+            self._shared_loader = False
+
+    def _get_daily_df(self):
+        """获取日线数据（带缓存）"""
+        # 如果有共享加载器，使用它的缓存
+        if self._shared_loader and self.loader is not None:
+            return self.loader._get_daily_df()
+
+        if self.use_cache and self._daily_cache is not None:
+            self._cache_stats['data_hits'] += 1
+            return self._daily_cache
+
+        self._cache_stats['data_misses'] += 1
+        df = pd.read_parquet(self.daily_file)
+
+        if self.use_cache:
+            self._daily_cache = df
+
+        return df
+
+    def get_cache_stats(self):
+        """获取缓存统计信息"""
+        return self._cache_stats.copy()
+
+    def clear_cache(self):
+        """清除缓存"""
+        self._daily_cache = None
+        self._last_date = None
+        self._last_pool = None
+        self._cache_stats = {'data_hits': 0, 'data_misses': 0, 'result_hits': 0}
 
     def get_stock_pool(self, current_date, stock_num=10):
         """
-        获取指定日期的股票池
+        获取指定日期的股票池（优化版 - 支持缓存）
 
         Args:
             current_date: 当前日期
@@ -122,8 +208,13 @@ class ValueStockSelector:
             list: 股票代码列表
         """
         try:
-            # 读取日线数据（包含PB和PE）
-            df = pd.read_parquet(self.daily_file)
+            # 检查结果缓存（同一天不重复计算）
+            if self.use_cache and self._last_date == current_date and self._last_pool is not None:
+                self._cache_stats['result_hits'] += 1
+                return self._last_pool
+
+            # 使用缓存读取日线数据
+            df = self._get_daily_df()
 
             # 获取最近一个交易日的数据
             latest_date = df.index.get_level_values('trade_date').max()
@@ -158,6 +249,11 @@ class ValueStockSelector:
 
             selected_stocks = df_selected.index.tolist()
 
+            # 缓存结果
+            if self.use_cache:
+                self._last_date = current_date
+                self._last_pool = selected_stocks
+
             return selected_stocks
 
         except Exception as e:
@@ -182,11 +278,11 @@ class RSRSStrategyFull(bt.Strategy):
         ('rsrs_period', 18),        # RSRS周期N
         ('rsrs_sample', 1100),      # RSRS样本数M
         ('buy_threshold', 0.7),     # 买入阈值
-        ('sell_threshold', -0.7),   # 危出阈值
+        ('sell_threshold', -0.7),   # 卖出阈值
         ('stock_num', 10),          # 持仓股票数
         ('index_code', '000300.SH'), # 基准指数(沪深300)
         ('data_loader', None),      # 数据加载器
-        ('data_path', '/Users/mac/Downloads/行情数据'),
+        ('data_path', r'C:\Users\perlicue\Documents\开发文档\stock_data\行情数据'),
         ('start_date', None),       # 回测开始日期
         ('end_date', None),         # 回测结束日期
         ('printlog', True),
@@ -200,8 +296,14 @@ class RSRSStrategyFull(bt.Strategy):
             sample=self.p.rsrs_sample
         )
 
-        # 选股器
-        self.selector = ValueStockSelector(self.p.data_path)
+        # 股票数据加载器
+        if self.p.data_loader:
+            self.loader = self.p.data_loader
+        else:
+            self.loader = TushareDataLoader(self.p.data_path)
+
+        # 选股器（共享加载器）
+        self.selector = ValueStockSelector(data_loader=self.loader)
 
         # 订单字典
         self.orders = {}
@@ -214,12 +316,6 @@ class RSRSStrategyFull(bt.Strategy):
 
         # 首次运行标志
         self.is_first_day = True
-
-        # 股票数据加载器
-        if self.p.data_loader:
-            self.loader = self.p.data_loader
-        else:
-            self.loader = TushareDataLoader(self.p.data_path)
 
     def prenext(self):
         """数据不足时的处理"""
@@ -239,7 +335,7 @@ class RSRSStrategyFull(bt.Strategy):
 
         # 定期输出状态
         if self.p.printlog and self.days % 20 == 0:
-            print(f'{current_date}: 运行第{self.days}天, RSRS={zscore_rightdev:.4f}, beta={beta:.4f}, R²={r2:.4f}')
+            print(f'{current_date}: 运行第{self.days}天, RSRS={zscore_rightdev:.4f}, beta={beta:.4f}, R2={r2:.4f}')
 
         # 择时信号判断
         if zscore_rightdev > self.p.buy_threshold:

@@ -1,5 +1,5 @@
 """
-RSRS价值选股策略 - 完整深度复刻回测脚本
+RSRS价值选股策略 - 完整深度复刻回测脚本（优化版）
 完全复刻聚宽原策略，不做任何简化
 
 策略参数：
@@ -9,14 +9,21 @@ RSRS价值选股策略 - 完整深度复刻回测脚本
 - 卖出阈值 = -0.7
 - 持仓股票数 = 10
 - 基准指数 = 沪深300 (000300.SH)
+
+优化点：
+- 数据加载缓存
+- RSRS指标向量化计算
+- 选股结果缓存
+- 各阶段耗时统计
 """
 
 import sys
 import os
 # 添加项目根目录到路径
-sys.path.insert(0, '/Users/mac/PycharmProjects/backtrader')
+sys.path.insert(0, r'C:\Users\perlicue\PycharmProjects\backtrader')
 
 from datetime import datetime
+import time
 import backtrader as bt
 import pandas as pd
 import numpy as np
@@ -24,14 +31,35 @@ from tushare_data_loader import TushareDataLoader
 from strategies.rsrs.rsrc_strategy_full import RSRSStrategyFull, ValueStockSelector
 
 
+# 数据路径配置
+DATA_PATH = r'C:\Users\perlicue\Documents\开发文档\stock_data\行情数据'
+
+
+class TimingContext:
+    """耗时统计上下文管理器"""
+
+    def __init__(self, name):
+        self.name = name
+        self.start_time = None
+        self.elapsed = None
+
+    def __enter__(self):
+        self.start_time = time.time()
+        return self
+
+    def __exit__(self, *args):
+        self.elapsed = time.time() - self.start_time
+        print(f"  [耗时] {self.name}: {self.elapsed:.2f}秒")
+
+
 def run_full_backtest():
     """
-    完整深度复刻版回测
-    完全按照原策略逻辑实现
+    完整深度复刻版回测（优化版）
+    完全按照原策略逻辑实现，添加耗时统计
     """
 
     print("=" * 80)
-    print("RSRS价值选股策略 - 完整深度复刻版")
+    print("RSRS价值选股策略 - 完整深度复刻版（优化版）")
     print("=" * 80)
     print("\n策略参数:")
     print("  RSRS周期N = 18")
@@ -42,53 +70,66 @@ def run_full_backtest():
     print("  基准指数 = 沪深300")
     print("=" * 80)
 
+    # 总耗时统计
+    total_start = time.time()
+    timings = {}
+
     # 1. 创建引擎
     cerebro = bt.Cerebro()
 
     # 2. 加载指数数据（用于RSRS择时）
     print("\n[1] 加载基准指数数据...")
-    loader = TushareDataLoader('/Users/mac/Downloads/行情数据')
+    with TimingContext("指数数据加载") as t:
+        loader = TushareDataLoader(DATA_PATH, use_cache=True)
 
-    # 由于没有沪深300数据，使用平安银行作为市场代理
-    # 实际应该使用沪深300或中证500等宽基指数
-    index_data = loader.load_daily_data(
-        ts_code='000001.SZ',  # 实际应该用沪深300: 000300.SH
-        start_date='2010-01-01',
-        end_date='2023-12-31',
-        adj_type='hfq'
-    )
-    index_data._name = 'index'
-    cerebro.adddata(index_data)
+        # 使用平安银行作为市场代理（实际应该用沪深300或中证500等宽基指数）
+        index_data = loader.load_daily_data(
+            ts_code='000001.SZ',
+            start_date='2010-01-01',
+            end_date='2023-12-31',
+            adj_type='hfq'
+        )
+        index_data._name = 'index'
+        cerebro.adddata(index_data)
+    timings['指数加载'] = t.elapsed
 
     print(f"  指数数据: {index_data._name}, 时间范围: 2010-01-01 至 2023-12-31")
 
     # 3. 加载股票池数据
     print("\n[2] 加载股票池数据...")
 
-    # 获取初始股票池
-    selector = ValueStockSelector('/Users/mac/Downloads/行情数据')
-    initial_pool = selector.get_stock_pool(datetime(2020, 1, 1), stock_num=20)
+    with TimingContext("初始股票池获取") as t:
+        # 获取初始股票池（共享loader的缓存）
+        selector = ValueStockSelector(data_path=DATA_PATH, use_cache=True)
+        initial_pool = selector.get_stock_pool(datetime(2020, 1, 1), stock_num=20)
+    timings['选股'] = t.elapsed
 
     print(f"  初始股票池: {len(initial_pool)} 只股票")
 
     # 加载股票数据
-    stock_count = 0
-    for stock_code in initial_pool[:5]:  # 限制数量避免内存问题
-        try:
-            stock_data = loader.load_daily_data(
-                ts_code=stock_code,
-                start_date='2010-01-01',
-                end_date='2023-12-31',
-                adj_type='hfq'
-            )
-            stock_data._name = stock_code
-            cerebro.adddata(stock_data)
-            stock_count += 1
-            print(f"    加载: {stock_code}")
-        except Exception as e:
-            print(f"    失败: {stock_code}, {e}")
+    with TimingContext("股票数据加载") as t:
+        stock_count = 0
+        for stock_code in initial_pool[:5]:  # 限制数量避免内存问题
+            try:
+                stock_data = loader.load_daily_data(
+                    ts_code=stock_code,
+                    start_date='2010-01-01',
+                    end_date='2023-12-31',
+                    adj_type='hfq'
+                )
+                stock_data._name = stock_code
+                cerebro.adddata(stock_data)
+                stock_count += 1
+                print(f"    加载: {stock_code}")
+            except Exception as e:
+                print(f"    失败: {stock_code}, {e}")
+    timings['股票加载'] = t.elapsed
 
     print(f"  成功加载 {stock_count} 只股票")
+
+    # 输出缓存统计
+    cache_stats = loader.get_cache_stats()
+    print(f"  数据加载器缓存: 命中{cache_stats['hits']}次, 未命中{cache_stats['misses']}次")
 
     # 4. 添加策略
     print("\n[3] 添加策略...")
@@ -128,8 +169,10 @@ def run_full_backtest():
     print(f'初始资金: {cerebro.broker.getvalue():.2f}')
     print("-" * 80)
 
-    results = cerebro.run()
-    strategy = results[0]
+    with TimingContext("策略运行(cerebro.run)") as t:
+        results = cerebro.run()
+        strategy = results[0]
+    timings['策略运行'] = t.elapsed
 
     # 8. 输出详细结果
     print("\n" + "=" * 80)
@@ -201,6 +244,21 @@ def run_full_backtest():
     years = 14  # 2010-2023
     annual_return = (pow(final_value / initial_value, 1 / years) - 1) * 100
     print(f'  年化收益率: {annual_return:.2f}%')
+
+    # 11. 输出耗时统计
+    total_elapsed = time.time() - total_start
+    print(f'\n【耗时统计】')
+    print(f'  ├─ 指数加载: {timings.get("指数加载", 0):.2f}秒')
+    print(f'  ├─ 选股: {timings.get("选股", 0):.2f}秒')
+    print(f'  ├─ 股票加载: {timings.get("股票加载", 0):.2f}秒')
+    print(f'  ├─ 策略运行: {timings.get("策略运行", 0):.2f}秒')
+    print(f'  └─ 总耗时: {total_elapsed:.2f}秒')
+
+    # 输出缓存统计
+    selector_stats = selector.get_cache_stats()
+    print(f'\n【缓存效果】')
+    print(f'  数据缓存: 命中{cache_stats["hits"]}次, 未命中{cache_stats["misses"]}次')
+    print(f'  选股缓存: 数据命中{selector_stats["data_hits"]}次, 结果命中{selector_stats["result_hits"]}次')
 
     print("\n" + "=" * 80)
 
