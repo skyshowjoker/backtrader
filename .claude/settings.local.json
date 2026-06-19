@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/perlicue/Documents/开发文档/stock_data/行情数据/**)",
+      "Bash(dir \"C:\\\\Users\\\\perlicue\\\\Documents\\\\开发文档\\\\stock_data\\\\行情数据\")",
+      "Bash(python *)",
+      "Bash(pip install *)"
+    ]
+  }
+}

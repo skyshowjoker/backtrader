@@ -1,0 +1,321 @@
+/* Backtrader 可视化回测平台 - 自定义样式 */
+
+/* ===== 全局 ===== */
+:root {
+    --primary: #2563eb;
+    --primary-light: #dbeafe;
+    --success: #16a34a;
+    --danger: #dc2626;
+    --warning: #d97706;
+    --gray-50: #f8fafc;
+    --gray-100: #f1f5f9;
+    --gray-200: #e2e8f0;
+    --gray-300: #cbd5e1;
+    --gray-500: #6b7280;
+    --gray-700: #374151;
+    --gray-900: #111827;
+    --sidebar-width: 320px;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background-color: var(--gray-50);
+    margin: 0;
+    padding: 0;
+}
+
+/* ===== 应用容器 ===== */
+.app-container {
+    min-height: 100vh;
+    padding: 0 !important;
+}
+
+/* ===== 顶部标题栏 ===== */
+.app-header {
+    background: linear-gradient(135deg, #1e3a5f 0%, #2563eb 100%);
+    color: white;
+    padding: 16px 24px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.header-content {
+    max-width: 1400px;
+    margin: 0 auto;
+}
+
+.app-title {
+    font-size: 24px;
+    font-weight: 700;
+    margin: 0 0 4px 0;
+    letter-spacing: 0.5px;
+}
+
+.app-subtitle {
+    font-size: 13px;
+    opacity: 0.8;
+    letter-spacing: 0.3px;
+}
+
+/* ===== 主体区域 ===== */
+.app-body {
+    display: flex;
+    max-width: 1400px;
+    margin: 0 auto;
+    min-height: calc(100vh - 80px);
+}
+
+/* ===== 左侧控制面板 ===== */
+.sidebar {
+    width: var(--sidebar-width);
+    min-width: var(--sidebar-width);
+    background: white;
+    border-right: 1px solid var(--gray-200);
+    padding: 20px;
+    overflow-y: auto;
+    max-height: calc(100vh - 80px);
+}
+
+.sidebar-section {
+    margin-bottom: 20px;
+}
+
+.sidebar-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--gray-700);
+    margin-bottom: 6px;
+    display: block;
+}
+
+.sidebar-hint {
+    font-size: 12px;
+    color: var(--gray-500);
+    padding: 8px 0;
+}
+
+.sidebar-dropdown {
+    width: 100%;
+}
+
+.sidebar-input {
+    width: 100%;
+    padding: 6px 10px;
+    border: 1px solid var(--gray-300);
+    border-radius: 4px;
+    font-size: 13px;
+}
+
+.sidebar-input:focus {
+    border-color: var(--primary);
+    outline: none;
+    box-shadow: 0 0 0 2px var(--primary-light);
+}
+
+.sidebar-datepicker {
+    width: 100%;
+}
+
+.sidebar-status {
+    font-size: 12px;
+    padding: 8px 0;
+    min-height: 24px;
+}
+
+.sidebar-run-btn {
+    margin-top: 4px;
+}
+
+/* ===== 参数配置 ===== */
+.param-row {
+    margin-bottom: 12px;
+}
+
+.param-label {
+    font-size: 12px;
+    color: var(--gray-500);
+    margin-bottom: 4px;
+    display: block;
+}
+
+.param-input {
+    width: 100%;
+    padding: 4px 8px;
+    border: 1px solid var(--gray-300);
+    border-radius: 4px;
+    font-size: 13px;
+}
+
+/* ===== 右侧内容区 ===== */
+.main-content {
+    flex: 1;
+    padding: 20px;
+    min-width: 0;
+}
+
+/* ===== Tab 样式 ===== */
+.custom-tabs {
+    margin-bottom: 16px;
+}
+
+.custom-tab {
+    font-size: 14px;
+    padding: 8px 16px;
+}
+
+.custom-tab--selected {
+    font-weight: 600;
+    border-top: 2px solid var(--primary) !important;
+}
+
+.tab-content {
+    min-height: 400px;
+}
+
+/* ===== 图表区 ===== */
+.chart-tab {
+    background: white;
+    border-radius: 8px;
+    padding: 16px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.chart-controls {
+    margin-bottom: 12px;
+    padding: 8px 12px;
+    background: var(--gray-50);
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+}
+
+.chart-toggles {
+    font-size: 13px;
+}
+
+.chart-placeholder-content {
+    text-align: center;
+    padding: 80px 0;
+    color: var(--gray-300);
+}
+
+/* ===== 绩效指标 ===== */
+.metrics-tab {
+    background: white;
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+.metric-card {
+    background: var(--gray-50);
+    border-radius: 8px;
+    padding: 16px;
+    text-align: center;
+    transition: transform 0.1s;
+}
+
+.metric-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+.metric-label {
+    font-size: 12px;
+    color: var(--gray-500);
+    margin-bottom: 8px;
+}
+
+.metric-value {
+    font-size: 24px;
+    font-weight: 700;
+    line-height: 1.2;
+}
+
+.metric-unit {
+    font-size: 11px;
+    color: var(--gray-300);
+    margin-top: 4px;
+}
+
+.section-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--gray-700);
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--gray-200);
+}
+
+.metrics-drawdown-section {
+    margin-top: 20px;
+}
+
+/* ===== 交易记录 ===== */
+.trades-tab {
+    background: white;
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.trade-stats-bar {
+    display: flex;
+    gap: 20px;
+    padding: 10px 0;
+    margin-bottom: 12px;
+    border-bottom: 1px solid var(--gray-200);
+    font-size: 13px;
+    color: var(--gray-700);
+}
+
+.trade-stat {
+    font-weight: 500;
+}
+
+/* ===== 上传区域 ===== */
+.upload-link {
+    color: var(--primary);
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.upload-status {
+    font-size: 12px;
+    margin-top: 4px;
+}
+
+/* ===== 响应式 ===== */
+@media (max-width: 1024px) {
+    .app-body {
+        flex-direction: column;
+    }
+
+    .sidebar {
+        width: 100%;
+        min-width: 100%;
+        max-height: none;
+        border-right: none;
+        border-bottom: 1px solid var(--gray-200);
+    }
+
+    .metrics-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+@media (max-width: 640px) {
+    .metrics-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .app-title {
+        font-size: 18px;
+    }
+}
