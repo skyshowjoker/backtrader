@@ -41,7 +41,7 @@ def initialize(context):
         "513130.XSHG",  # 恒生科技
         "512890.XSHG",  # 红利低波
         '159915.XSHE',  # 创业板
-        '510300.XSHE',    # 沪深300
+        '510300.XSHG',    # 沪深300
     ]
     g.m_days = 25
     g.auto_day = True
