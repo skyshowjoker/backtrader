@@ -1,7 +1,7 @@
 """策略选择回调 - 动态参数 UI 生成 + 参数值缓存"""
 
 import json
-from dash import Input, Output, State, callback_context, no_update, html, dcc, ALL, MATCH
+from dash import Input, Output, State, no_update, html, dcc, ALL
 
 from ui.strategies.registry import StrategyRegistry
 
@@ -67,7 +67,7 @@ def register_strategy_callbacks(app):
                 # 类型转换
                 value = param_values[i]
                 if p['type'] == 'bool':
-                    value = bool(value)
+                    value = bool(value[0]) if isinstance(value, list) and value else False
                 elif p['type'] == 'int':
                     value = int(value)
                 elif p['type'] == 'float':
@@ -98,6 +98,7 @@ def _create_param_component(param_schema):
             value=[default] if default else [],
             inline=True,
             inputStyle={'margin-right': '5px'},
+            className='param-checklist',
         )
     elif ptype == 'int':
         component = dcc.Input(

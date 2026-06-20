@@ -1,12 +1,14 @@
 """回测运行回调 - 运行回测、轮询结果、填充图表和指标"""
 
 import json
-from dash import Input, Output, State, callback_context, no_update, html
+from dash import Input, Output, State, no_update, html
 import dash_bootstrap_components as dbc
 
 from ui.engines.runner import start_backtest, check_result
 from ui.strategies.registry import StrategyRegistry
-from ui.layouts.chart_tab import build_chart_figure
+from ui.layouts.chart_tab import (build_chart_figure,
+                                  build_signal_analysis_figure,
+                                  build_signal_summary)
 from ui.layouts.metrics_tab import build_metrics_content, build_drawdown_chart
 from ui.layouts.trades_tab import build_trades_table
 
@@ -39,12 +41,21 @@ def register_backtest_callbacks(app):
                               params_json):
         """点击运行回测按钮 → 启动异步回测"""
         if not n_clicks or not strategy_name:
-            return no_update, True, html.Span('请先选择策略', style={'color': '#dc2626'})
+            return no_update, True, html.Span('请先选择策略', className='status-error')
+
+        if not start_date or not end_date:
+            return no_update, True, html.Span('请选择完整日期范围', className='status-error')
+
+        if start_date > end_date:
+            return no_update, True, html.Span('开始日期不能晚于结束日期', className='status-error')
+
+        if not data_codes:
+            return no_update, True, html.Span('请至少选择一个标的代码', className='status-error')
 
         # 获取策略类
         strategy_class = StrategyRegistry.get_class(strategy_name)
         if not strategy_class:
-            return no_update, True, html.Span(f'策略未找到: {strategy_name}', style={'color': '#dc2626'})
+            return no_update, True, html.Span(f'策略未找到: {strategy_name}', className='status-error')
 
         # 读取策略参数
         params = _read_params(strategy_name, params_json)
@@ -53,23 +64,29 @@ def register_backtest_callbacks(app):
         config = {
             'start_date': start_date,
             'end_date': end_date,
-            'initial_cash': float(initial_cash) if initial_cash else 1000000,
-            'commission': float(commission) if commission else 0.0002,
             'benchmark': benchmark or '000300',
             'data_codes': data_codes or ['510300'],
             'data_type': 'etf',
         }
 
+        try:
+            config['initial_cash'] = _parse_non_negative_float(
+                initial_cash, 1000000, '初始资金')
+            config['commission'] = _parse_non_negative_float(
+                commission, 0.0002, '佣金率')
+        except ValueError as e:
+            return no_update, True, html.Span(str(e), className='status-error')
+
         # 启动异步回测
         try:
             task_id = start_backtest(strategy_class, params, config)
         except Exception as e:
-            return no_update, True, html.Span(f'启动失败: {e}', style={'color': '#dc2626'})
+            return no_update, True, html.Span(f'启动失败: {e}', className='status-error')
 
         status_msg = html.Div([
             dbc.Spinner(size='sm', color='primary'),
-            html.Span(' 回测运行中...', style={'marginLeft': '8px', 'color': '#2563eb'}),
-        ], style={'display': 'flex', 'alignItems': 'center'})
+            html.Span('回测运行中...', className='status-running-text'),
+        ], className='status-running')
 
         return task_id, False, status_msg
 
@@ -80,6 +97,8 @@ def register_backtest_callbacks(app):
             Output('metrics-container', 'children'),
             Output('drawdown-chart', 'figure'),
             Output('trades-table-container', 'children'),
+            Output('signal-analysis-chart', 'figure'),
+            Output('signal-summary-content', 'children'),
             Output('backtest-results', 'data'),
             Output('chart-placeholder', 'style'),
             Output('status-message', 'children', allow_duplicate=True),
@@ -95,20 +114,49 @@ def register_backtest_callbacks(app):
     def poll_result(n_intervals, task_id, toggles):
         """轮询回测结果"""
         if not task_id:
-            return (no_update,) * 8
+            return (no_update,) * 10
 
         result_info = check_result(task_id)
 
         if result_info['status'] == 'running':
-            return (no_update,) * 8
+            partial = result_info.get('data')
+            if not partial:
+                status_msg = _running_status(result_info.get('message') or '回测运行中...')
+                return (no_update,) * 8 + (status_msg, False)
+
+            toggles = toggles or ['strategy_nav', 'strategy_return',
+                                  'benchmark_return', 'excess_return', 'signals']
+            fig = build_chart_figure(partial, toggles)
+            signal_fig = build_signal_analysis_figure(partial)
+            signal_summary = build_signal_summary(partial)
+            result_json = _serialize_result(partial)
+            status_msg = _running_status(result_info.get('message') or '数据加载中...')
+
+            return (
+                fig,
+                no_update,
+                no_update,
+                no_update,
+                signal_fig,
+                signal_summary,
+                result_json,
+                {'display': 'none'},
+                status_msg,
+                False,
+            )
 
         if result_info['status'] == 'error':
-            error_msg = html.Span(f"回测失败: {result_info['data']}", style={'color': '#dc2626'})
-            return (no_update,) * 5 + ({'display': 'none'}, error_msg, True)
+            error_msg = html.Span(f"回测失败: {result_info['data']}", className='status-error')
+            return (no_update,) * 7 + ({'display': 'none'}, error_msg, True)
+
+        if result_info['status'] != 'done':
+            error_msg = html.Span('未找到回测任务，请重新运行', className='status-error')
+            return (no_update,) * 7 + ({'display': 'none'}, error_msg, True)
 
         # 回测完成
         result = result_info['data']
-        toggles = toggles or ['strategy_nav', 'benchmark_nav', 'signals']
+        toggles = toggles or ['strategy_nav', 'strategy_return',
+                              'benchmark_return', 'excess_return', 'signals']
 
         # 构建图表
         fig = build_chart_figure(result, toggles)
@@ -122,15 +170,19 @@ def register_backtest_callbacks(app):
         # 构建交易表
         trades_table = build_trades_table(result.get('trades', []))
 
+        # 构建信号分析
+        signal_fig = build_signal_analysis_figure(result)
+        signal_summary = build_signal_summary(result)
+
         # 状态消息
         total_return = result.get('metrics', {}).get('total_return', 0)
         final_value = result.get('final_value', 0)
+        benchmark_source = _format_benchmark_source(result.get('benchmark_source'))
         status_msg = html.Div([
-            html.Span('回测完成', style={'color': '#16a34a', 'fontWeight': 'bold'}),
-            html.Br(),
-            html.Span(f"总收益: {total_return:.2f}% | 终值: {final_value:,.0f}",
-                      style={'fontSize': '12px', 'color': '#4b5563'}),
-        ])
+            html.Span('回测完成', className='status-success-title'),
+            html.Span(f"总收益: {total_return:.2f}% | 终值: {final_value:,.0f}{benchmark_source}",
+                      className='status-success-detail'),
+        ], className='status-success')
 
         # 隐藏占位符
         placeholder_style = {'display': 'none'}
@@ -138,7 +190,18 @@ def register_backtest_callbacks(app):
         # 缓存结果
         result_json = _serialize_result(result)
 
-        return fig, metrics_cards, dd_fig, trades_table, result_json, placeholder_style, status_msg, True
+        return (
+            fig,
+            metrics_cards,
+            dd_fig,
+            trades_table,
+            signal_fig,
+            signal_summary,
+            result_json,
+            placeholder_style,
+            status_msg,
+            True,
+        )
 
     # ===== 图表切换 =====
     @app.callback(
@@ -199,3 +262,34 @@ def _deserialize_result(result_json):
         return json.loads(result_json)
     except Exception:
         return {}
+
+
+def _parse_non_negative_float(value, default, label):
+    """解析顶部工具条中的数值输入。"""
+    if value is None or str(value).strip() == '':
+        return default
+
+    normalized = str(value).replace(',', '').strip()
+    try:
+        number = float(normalized)
+    except ValueError:
+        raise ValueError(f'{label}必须是数字')
+
+    if number < 0:
+        raise ValueError(f'{label}不能为负数')
+    return number
+
+
+def _running_status(message):
+    """构建运行中状态。"""
+    return html.Div([
+        dbc.Spinner(size='sm', color='primary'),
+        html.Span(message, className='status-running-text'),
+    ], className='status-running')
+
+
+def _format_benchmark_source(source):
+    """展示基准兜底来源。"""
+    if source and source.startswith('proxy:'):
+        return f" | 基准代用: {source.split(':', 1)[1]}"
+    return ''

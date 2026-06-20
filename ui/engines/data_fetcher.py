@@ -5,6 +5,7 @@
 """
 
 import os
+from pathlib import Path
 import pandas as pd
 import akshare as ak
 
@@ -15,6 +16,10 @@ os.environ['NO_PROXY'] = '*'
 
 # 内存缓存：key = (code, start_date, end_date), value = DataFrame
 _cache = {}
+_CACHE_DIR = Path(os.environ.get(
+    'BACKTRADER_DATA_CACHE',
+    Path(__file__).resolve().parents[2] / '.cache' / 'market_data',
+))
 
 # 常见基准指数代码
 BENCHMARK_POOL = {
@@ -56,8 +61,9 @@ def download_etf_data(code, start_date, end_date):
         或 None（下载失败时）
     """
     cache_key = (code, start_date, end_date)
-    if cache_key in _cache:
-        return _cache[cache_key]
+    cached = _get_cached(cache_key)
+    if cached is not None:
+        return cached
 
     df = None
 
@@ -82,12 +88,15 @@ def download_etf_data(code, start_date, end_date):
     # 方式2: 腾讯财经接口
     if df is None or df.empty:
         try:
-            df = _download_from_qq(code, start_date, end_date)
+            market = _infer_market(code, data_type='etf')
+            df = _download_from_qq(code, start_date, end_date, market=market)
         except Exception as e:
             print(f"[FAIL] {code} all sources failed: {e}")
 
     if df is not None and not df.empty:
-        _cache[cache_key] = df
+        _set_cached(cache_key, df)
+    else:
+        _set_cached(cache_key, _empty_frame())
 
     return df
 
@@ -105,8 +114,9 @@ def download_index_data(code, start_date, end_date):
         或 None（下载失败时）
     """
     cache_key = (f"idx_{code}", start_date, end_date)
-    if cache_key in _cache:
-        return _cache[cache_key]
+    cached = _get_cached(cache_key)
+    if cached is not None:
+        return cached
 
     df = None
     try:
@@ -129,12 +139,17 @@ def download_index_data(code, start_date, end_date):
     # 兜底：腾讯接口（指数也支持）
     if df is None or df.empty:
         try:
-            df = _download_from_qq(code, start_date, end_date)
+            df = _download_from_qq(
+                code, start_date, end_date,
+                market=_infer_market(code, data_type='index'),
+            )
         except Exception as e:
             print(f"[qq index fail] {code}: {e}")
 
     if df is not None and not df.empty:
-        _cache[cache_key] = df
+        _set_cached(cache_key, df)
+    else:
+        _set_cached(cache_key, _empty_frame())
 
     return df
 
@@ -152,8 +167,9 @@ def download_stock_data(code, start_date, end_date):
         或 None（下载失败时）
     """
     cache_key = (f"stk_{code}", start_date, end_date)
-    if cache_key in _cache:
-        return _cache[cache_key]
+    cached = _get_cached(cache_key)
+    if cached is not None:
+        return cached
 
     df = None
     try:
@@ -176,12 +192,17 @@ def download_stock_data(code, start_date, end_date):
     # 兜底：腾讯接口
     if df is None or df.empty:
         try:
-            df = _download_from_qq(code, start_date, end_date)
+            df = _download_from_qq(
+                code, start_date, end_date,
+                market=_infer_market(code, data_type='stock'),
+            )
         except Exception as e:
             print(f"[qq stock fail] {code}: {e}")
 
     if df is not None and not df.empty:
-        _cache[cache_key] = df
+        _set_cached(cache_key, df)
+    else:
+        _set_cached(cache_key, _empty_frame())
 
     return df
 
@@ -226,7 +247,140 @@ def clear_cache():
     _cache.clear()
 
 
-def _download_from_qq(code, start_date, end_date):
+def _get_cached(cache_key):
+    if cache_key in _cache:
+        return _cache[cache_key]
+
+    path = _cache_path(cache_key)
+    if path.exists():
+        try:
+            df = pd.read_pickle(path)
+        except Exception as exc:
+            print(f"[cache read fail] {path.name}: {exc}")
+        else:
+            if df is not None:
+                _cache[cache_key] = df
+                return df
+
+    return _get_superset_cached(cache_key)
+
+
+def _set_cached(cache_key, df):
+    _cache[cache_key] = df
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_pickle(_cache_path(cache_key))
+    except Exception as exc:
+        print(f"[cache write fail] {cache_key}: {exc}")
+
+
+def _cache_path(cache_key):
+    name = '_'.join(str(part).replace('/', '-').replace(':', '-') for part in cache_key)
+    return _CACHE_DIR / f'{name}.pkl'
+
+
+def _get_superset_cached(cache_key):
+    """Reuse a wider cached date range for shorter backtests."""
+    symbol, start_date, end_date = cache_key
+    covered_empty = False
+
+    for cached_key, cached_df in list(_cache.items()):
+        if _covers_range(cached_key, symbol, start_date, end_date):
+            sliced = _slice_cached_df(cached_df, start_date, end_date)
+            if sliced is not None and not sliced.empty:
+                _cache[cache_key] = sliced
+                return sliced
+            covered_empty = True
+
+    if not _CACHE_DIR.exists():
+        return _empty_cached(cache_key) if covered_empty else None
+
+    for path in _CACHE_DIR.glob('*.pkl'):
+        cached_key = _parse_cache_stem(path.stem)
+        if not cached_key or not _covers_range(cached_key, symbol, start_date, end_date):
+            continue
+        try:
+            cached_df = pd.read_pickle(path)
+        except Exception as exc:
+            print(f"[cache read fail] {path.name}: {exc}")
+            continue
+        sliced = _slice_cached_df(cached_df, start_date, end_date)
+        if sliced is not None and not sliced.empty:
+            _cache[cache_key] = sliced
+            return sliced
+        covered_empty = True
+
+    return _empty_cached(cache_key) if covered_empty else None
+
+
+def _empty_cached(cache_key):
+    df = _empty_frame()
+    _cache[cache_key] = df
+    return df
+
+
+def _empty_frame():
+    df = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+    df.index = pd.DatetimeIndex([], name='date')
+    return df
+
+
+def _covers_range(cached_key, symbol, start_date, end_date):
+    return (
+        len(cached_key) == 3
+        and cached_key[0] == symbol
+        and str(cached_key[1]) <= str(start_date)
+        and str(cached_key[2]) >= str(end_date)
+    )
+
+
+def _parse_cache_stem(stem):
+    parts = str(stem).split('_')
+    if len(parts) < 3:
+        return None
+    end_date = parts[-1]
+    start_date = parts[-2]
+    symbol = '_'.join(parts[:-2])
+    if len(start_date) != 8 or len(end_date) != 8:
+        return None
+    return symbol, start_date, end_date
+
+
+def _slice_cached_df(df, start_date, end_date):
+    if df is None or df.empty:
+        return None
+    start_ts = pd.to_datetime(start_date)
+    end_ts = pd.to_datetime(end_date)
+    sliced = df.loc[(df.index >= start_ts) & (df.index <= end_ts)].copy()
+    return sliced if not sliced.empty else None
+
+
+def _infer_market(code, data_type='auto'):
+    """推断腾讯接口所需市场前缀。"""
+    code = str(code or '')
+
+    if data_type == 'index':
+        if code.startswith('399'):
+            return 'sz'
+        return 'sh'
+
+    if data_type == 'stock':
+        if code.startswith(('6', '9')):
+            return 'sh'
+        return 'sz'
+
+    if code.startswith(('5', '588', '589')):
+        return 'sh'
+    if code.startswith(('15', '16', '18')):
+        return 'sz'
+    if code.startswith(('6', '9')):
+        return 'sh'
+    if code.startswith(('000', '001', '002', '003', '300', '301')):
+        return 'sz'
+    return 'sz'
+
+
+def _download_from_qq(code, start_date, end_date, market=None):
     """通过腾讯财经接口下载 ETF 历史数据（兜底方案）
 
     Args:
@@ -236,7 +390,7 @@ def _download_from_qq(code, start_date, end_date):
     """
     import requests as _requests
 
-    market = 'sh' if code.startswith(('5', '6')) else 'sz'
+    market = market or ('sh' if code.startswith(('5', '6')) else 'sz')
     symbol = f"{market}{code}"
 
     all_data = []

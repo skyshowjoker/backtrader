@@ -23,6 +23,7 @@ import dash_bootstrap_components as dbc
 # 注册内置策略（导入即注册）
 from ui.strategies.sma_cross import SMACrossStrategy
 from ui.strategies.registry import StrategyRegistry
+from ui.engines.data_fetcher import BENCHMARK_POOL
 
 # 导入布局组件
 from ui.layouts.sidebar import create_sidebar
@@ -50,25 +51,114 @@ try:
 except Exception:
     pass
 
+# 注册本地 strategies/etf/etf.py 聚宽策略（只读取并适配，不改动策略源码）
+try:
+    from ui.strategies.joinquant_builtin import register_joinquant_etf_strategy
+    register_joinquant_etf_strategy()
+except Exception:
+    pass
+
 # ===== 创建 Dash 应用 =====
 app = dash.Dash(
     __name__,
-    external_stylesheets=[dbc.themes.FLATLY],
+    external_stylesheets=[dbc.themes.BOOTSTRAP],
     suppress_callback_exceptions=True,
-    title='Backtrader 可视化回测平台',
+    title='Backtrader 回测工作台',
 )
 
 server = app.server  # Gunicorn 部署用
 
 # ===== 应用布局 =====
 app.layout = dbc.Container([
-    # 顶部标题栏
+    # 聚宽风格顶部导航
     html.Div([
         html.Div([
-            html.H1('📈 Backtrader 可视化回测平台', className='app-title'),
-            html.Span('交互式策略回测 · 净值曲线 · 信号分析 · 绩效评估', className='app-subtitle'),
-        ], className='header-content'),
+            html.Div([
+                html.Span(className='jq-logo-bars'),
+                html.Span('BackQuant', className='jq-logo-text'),
+            ], className='jq-brand'),
+            html.Div([
+                html.Span('首页'),
+                html.Span('量化研究平台', className='jq-nav-active'),
+                html.Span('策略社区'),
+                html.Span('帮助'),
+                html.Span('本地数据'),
+            ], className='jq-nav'),
+        ], className='jq-header-inner'),
+        html.Div([
+            html.Div('BT', className='jq-avatar'),
+        ], className='jq-user-zone'),
     ], className='app-header'),
+
+    # 策略标题和工作区导航
+    html.Div([
+        html.Div([
+            html.Span('‹', className='strategy-back'),
+            html.H1('ETF轮动最终优化', className='strategy-title'),
+            html.Span('✎', className='strategy-edit-icon'),
+        ], className='strategy-title-group'),
+        html.Div([
+            html.Span('编辑策略', className='worktab worktab-active'),
+            html.Span('回测详情', className='worktab'),
+            html.Span('编译运行列表', className='worktab'),
+            html.Span('回测列表', className='worktab'),
+        ], className='workspace-tabs'),
+    ], className='strategy-titlebar'),
+
+    # 回测参数工具条
+    html.Div([
+        html.Div([
+            html.Span('设置：', className='toolbar-label'),
+            dcc.DatePickerRange(
+                id='date-range',
+                start_date='2020-01-01',
+                end_date='2025-12-31',
+                display_format='YYYY-MM-DD',
+                clearable=False,
+                className='toolbar-datepicker',
+            ),
+            html.Span('¥', className='toolbar-currency'),
+            dcc.Input(
+                id='initial-cash',
+                type='text',
+                value='1000000',
+                placeholder='初始资金',
+                className='toolbar-input cash-input',
+            ),
+            dcc.Input(
+                id='commission',
+                type='text',
+                value='0.0002',
+                placeholder='佣金率',
+                className='toolbar-input commission-input',
+            ),
+            dcc.Dropdown(
+                id='benchmark-selector',
+                options=[{'label': f"{code} {name}", 'value': code}
+                         for code, name in BENCHMARK_POOL.items()],
+                value='000300',
+                clearable=False,
+                className='toolbar-dropdown benchmark-toolbar',
+            ),
+            dcc.Dropdown(
+                id='frequency-selector',
+                options=[
+                    {'label': '每天', 'value': 'daily'},
+                    {'label': '每周', 'value': 'weekly'},
+                    {'label': '每月', 'value': 'monthly'},
+                ],
+                value='daily',
+                clearable=False,
+                className='toolbar-dropdown frequency-toolbar',
+            ),
+            html.Span('Python3', className='python-badge'),
+        ], className='backtest-settings'),
+        html.Div([
+            html.Div(id='status-message', className='toolbar-status'),
+            dbc.Button('运行回测', id='run-button', color='primary',
+                       className='toolbar-run-btn'),
+        ], className='toolbar-actions'),
+    ], className='backtest-toolbar'),
 
     # 主体区域
     html.Div([
@@ -78,16 +168,16 @@ app.layout = dbc.Container([
         # 右侧内容区
         html.Div([
             dcc.Tabs(id='main-tabs', value='chart', children=[
-                dcc.Tab(label='📊 图表', value='chart', className='custom-tab',
+                dcc.Tab(label='收益概览', value='chart', className='custom-tab',
                         selected_className='custom-tab--selected'),
-                dcc.Tab(label='📋 绩效指标', value='metrics', className='custom-tab',
+                dcc.Tab(label='归因分析', value='metrics', className='custom-tab',
                         selected_className='custom-tab--selected'),
-                dcc.Tab(label='📝 交易记录', value='trades', className='custom-tab',
+                dcc.Tab(label='交易详情', value='trades', className='custom-tab',
                         selected_className='custom-tab--selected'),
             ], className='custom-tabs'),
 
             # Tab 内容
-            html.Div(id='tab-content', className='tab-content'),
+            html.Div(id='tab-content', className='main-tab-content'),
         ], className='main-content'),
     ], className='app-body'),
 

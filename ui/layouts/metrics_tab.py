@@ -7,25 +7,30 @@ import plotly.graph_objects as go
 def create_metrics_tab():
     """创建绩效指标 Tab 布局"""
     return html.Div([
+        html.Div([
+            html.H3('绩效概览', className='panel-title'),
+            html.Span('收益、风险与交易质量', className='panel-subtitle'),
+        ], className='panel-heading metrics-heading'),
+
         # 指标卡片网格
         html.Div(id='metrics-container', children=[
-            _metric_card('总收益率', 'total_return', '%', '#2563eb'),
-            _metric_card('年化收益率', 'annual_return', '%', '#7c3aed'),
-            _metric_card('夏普比率', 'sharpe_ratio', '', '#059669'),
-            _metric_card('最大回撤', 'max_drawdown', '%', '#dc2626'),
-            _metric_card('胜率', 'win_rate', '%', '#d97706'),
-            _metric_card('盈亏比', 'profit_factor', '', '#0891b2'),
-            _metric_card('总交易次数', 'total_trades', '次', '#4b5563'),
-            _metric_card('最大回撤持续', 'max_drawdown_duration', '天', '#9333ea'),
+            _metric_card('总收益率', 'total_return', '%', '#2f6bff'),
+            _metric_card('年化收益率', 'annual_return', '%', '#00a896'),
+            _metric_card('夏普比率', 'sharpe_ratio', '', '#0b7285'),
+            _metric_card('最大回撤', 'max_drawdown', '%', '#b45f3d'),
+            _metric_card('胜率', 'win_rate', '%', '#c8a24a'),
+            _metric_card('盈亏比', 'profit_factor', '', '#2aa7a5'),
+            _metric_card('总交易次数', 'total_trades', '次', '#5b6b7d'),
+            _metric_card('最大回撤持续', 'max_drawdown_duration', '天', '#8b5cf6'),
         ], className='metrics-grid'),
 
         # 回撤曲线
         html.Div([
-            html.H5('📉 回撤曲线', className='section-title'),
+            html.H5('回撤曲线', className='section-title'),
             dcc.Graph(
                 id='drawdown-chart',
                 config={'displayModeBar': False},
-                style={'height': '250px'},
+                className='drawdown-graph',
             ),
         ], className='metrics-drawdown-section'),
 
@@ -44,14 +49,14 @@ def build_metrics_content(metrics):
     cards = []
 
     card_configs = [
-        ('总收益率', 'total_return', '%', '#2563eb', _fmt_pct),
-        ('年化收益率', 'annual_return', '%', '#7c3aed', _fmt_pct),
-        ('夏普比率', 'sharpe_ratio', '', '#059669', _fmt_sharpe),
-        ('最大回撤', 'max_drawdown', '%', '#dc2626', _fmt_pct),
-        ('胜率', 'win_rate', '%', '#d97706', _fmt_pct),
-        ('盈亏比', 'profit_factor', '', '#0891b2', _fmt_pf),
-        ('总交易次数', 'total_trades', '次', '#4b5563', _fmt_int),
-        ('最大回撤持续', 'max_drawdown_duration', '天', '#9333ea', _fmt_int),
+        ('总收益率', 'total_return', '%', '#2f6bff', _fmt_pct),
+        ('年化收益率', 'annual_return', '%', '#00a896', _fmt_pct),
+        ('夏普比率', 'sharpe_ratio', '', '#0b7285', _fmt_sharpe),
+        ('最大回撤', 'max_drawdown', '%', '#b45f3d', _fmt_pct),
+        ('胜率', 'win_rate', '%', '#c8a24a', _fmt_pct),
+        ('盈亏比', 'profit_factor', '', '#2aa7a5', _fmt_pf),
+        ('总交易次数', 'total_trades', '次', '#5b6b7d', _fmt_int),
+        ('最大回撤持续', 'max_drawdown_duration', '天', '#8b5cf6', _fmt_int),
     ]
 
     for label, key, unit, color, fmt_func in card_configs:
@@ -73,8 +78,8 @@ def build_drawdown_chart(result):
     if not nav_values or not nav_dates:
         fig = go.Figure()
         fig.add_annotation(text="暂无数据", xref="paper", yref="paper",
-                           x=0.5, y=0.5, showarrow=False, font=dict(size=14, color='#999'))
-        fig.update_layout(template='plotly_white', height=250, margin=dict(l=60, r=30, t=20, b=30))
+                           x=0.5, y=0.5, showarrow=False, font=dict(size=14, color='#94a3b8'))
+        fig.update_layout(template='plotly_white', height=280, margin=dict(l=54, r=24, t=20, b=34))
         return fig
 
     # 计算回撤
@@ -92,17 +97,19 @@ def build_drawdown_chart(result):
         y=drawdowns,
         name='回撤',
         fill='tozeroy',
-        line=dict(color='#ef4444', width=1),
-        fillcolor='rgba(239, 68, 68, 0.15)',
+        line=dict(color='#b45f3d', width=1.5),
+        fillcolor='rgba(180, 95, 61, 0.14)',
         hovertemplate='日期: %{x}<br>回撤: %{y:.2f}%<extra></extra>',
     ))
 
     fig.update_layout(
         template='plotly_white',
-        height=250,
-        margin=dict(l=60, r=30, t=20, b=30),
-        yaxis=dict(title='回撤 (%)', tickformat='.1f'),
-        xaxis=dict(title=''),
+        paper_bgcolor='#ffffff',
+        plot_bgcolor='#ffffff',
+        height=280,
+        margin=dict(l=54, r=24, t=20, b=34),
+        yaxis=dict(title='回撤 (%)', tickformat='.1f', gridcolor='#edf2f7', zeroline=False),
+        xaxis=dict(title='', gridcolor='#edf2f7', zeroline=False),
         showlegend=False,
     )
 
@@ -116,7 +123,7 @@ def _metric_card(label, key, unit, color):
         html.Div(id=f'metric-{key}', children='--', className='metric-value',
                  style={'color': color}),
         html.Div(unit, className='metric-unit'),
-    ], className='metric-card', style={'borderLeft': f'3px solid {color}'})
+    ], className='metric-card', style={'--metric-color': color})
 
 
 def _build_metric_card(label, display_value, color):
@@ -124,7 +131,7 @@ def _build_metric_card(label, display_value, color):
     return html.Div([
         html.Div(label, className='metric-label'),
         html.Div(display_value, className='metric-value', style={'color': color}),
-    ], className='metric-card', style={'borderLeft': f'3px solid {color}'})
+    ], className='metric-card', style={'--metric-color': color})
 
 
 # ===== 格式化函数 =====
