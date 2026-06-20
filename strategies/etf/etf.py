@@ -82,6 +82,7 @@ def initialize(context):
     g.min_days = 20     # 动态回看期下限（约4周）
     g.max_days = 60     # 动态回看期上限（约12周）
     g.drop = 0.95       # 最近三天跌幅
+    g.debug = False      # 打印详细日志
 
     # ---- 定时任务 ----
     # 每个交易日9:40执行trade函数（开盘后10分钟，避开集合竞价波动）
@@ -157,7 +158,7 @@ def get_rank(etf_pool):
     return data.index.tolist()
 
 
-def get_rank2(etf_pool):
+def get_rank2(etf_pool, context=None):
     """基于ATR动态调整回看期的动量轮动
 
     与get_rank的区别：回看期不是固定的25天，而是根据ATR（平均真实波幅）动态调整。
@@ -232,8 +233,52 @@ def get_rank2(etf_pool):
         if min(prices[-1] / prices[-2], prices[-2] / prices[-3], prices[-3] / prices[-4]) < g.drop:
             data.loc[etf, "score"] = 0
 
-    # 过滤与排序（同get_rank）
+    # ---- 过滤与排序（同get_rank）----
+    # 0 < score：排除负分（下跌趋势）和零分（急跌保护触发）
+    # score < 6：排除异常高分（年化500%+，可能是数据异常或停牌复牌）
     data = data.query("0 < score < 6").sort_values(by="score", ascending=False)
+        # ---- 可视化输出 ----
+    # 打印全部ETF的评分明细(含被过滤的), 方便调试和观察
+    if g.debug:
+        print("=" * 72)
+        print("  ETF动量评分明细(动态回看期) 日期: %s" % (context.current_dt.date() if context else '---'))
+        print("=" * 72)
+        # 构建完整展示表: 合并过滤前全量数据 + 过滤后结果
+        full_data = pd.DataFrame(index=g.etf_pool, columns=["annualized_returns", "r2", "score"])
+        for etf in g.etf_pool:
+            if etf in data.index:
+                full_data.loc[etf] = data.loc[etf]
+        # 按score降序排列, NaN排最后
+        full_data = full_data.sort_values(by="score", ascending=False, na_position='last')
+        # 格式化输出
+        for etf in full_data.index:
+            row = full_data.loc[etf]
+            ar = row["annualized_returns"]
+            r2 = row["r2"]
+            sc = row["score"]
+            if pd.isna(sc):
+                # 未参与评分(数据不足被continue)
+                print("  %-16s  年化: %8s  R2: %6s  评分: %6s  X 数据不足" % (etf, '---', '---', '---'))
+            elif sc <= 0 or sc >= 6:
+                # 被过滤的(score<=0 或 score>=6)
+                reason = "急跌保护" if sc == 0 else ("下跌趋势" if ar is not None and ar < 0 else "异常高分")
+                ar_str = "%+.2f%%" % (ar * 100) if not pd.isna(ar) else "---"
+                r2_str = "%.4f" % r2 if not pd.isna(r2) else "---"
+                sc_str = "%.4f" % sc if not pd.isna(sc) else "---"
+                print("  %-16s  年化: %8s  R2: %6s  评分: %6s  X %s" % (etf, ar_str, r2_str, sc_str, reason))
+            else:
+                # 有效的
+                ar_str = "%+.2f%%" % (ar * 100) if not pd.isna(ar) else "---"
+                r2_str = "%.4f" % r2 if not pd.isna(r2) else "---"
+                sc_str = "%.4f" % sc if not pd.isna(sc) else "---"
+                print("  %-16s  年化: %8s  R2: %6s  评分: %6s  V" % (etf, ar_str, r2_str, sc_str))
+        print("-" * 72)
+        if len(data) > 0:
+            print("  >> 目标持仓: %s  评分: %.4f" % (data.index[0], data.iloc[0]['score']))
+        else:
+            print("  >> 无合格标的, 全仓持有现金")
+        print("=" * 72)
+
     return data.index.tolist()
 
 
@@ -249,7 +294,7 @@ def trade(context):
 
     # 根据auto_day选择评分方法
     if g.auto_day:
-        target_list = get_rank2(g.etf_pool)[:target_num]  # ATR动态回看期评分
+        target_list = get_rank2(g.etf_pool, context)[:target_num]  # ATR动态回看期评分
     else:
         target_list = get_rank(g.etf_pool)[:target_num]   # 固定回看期评分
 
