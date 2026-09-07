@@ -536,8 +536,8 @@ def _extract_positions(strat):
 
 
 def _extract_orders(strat):
-    """提取完整订单流水，包括未成交/取消订单。"""
-    orders = []
+    """提取每个订单的最终状态流水，保留未成交/取消/拒单。"""
+    orders_by_ref = {}
     status_names = {
         getattr(bt.Order, 'Submitted', None): 'Submitted',
         getattr(bt.Order, 'Accepted', None): 'Accepted',
@@ -553,7 +553,8 @@ def _extract_orders(strat):
         for order in getattr(strat, '_orders', []) or []:
             created_dt = _order_date(order.created.dt) if getattr(order, 'created', None) else ''
             executed_dt = _order_date(order.executed.dt) if getattr(order, 'executed', None) else ''
-            orders.append({
+            ref = getattr(order, 'ref', '')
+            orders_by_ref[ref] = {
                 'ref': getattr(order, 'ref', ''),
                 'date': executed_dt or created_dt,
                 'created_date': created_dt,
@@ -567,11 +568,13 @@ def _extract_orders(strat):
                 'executed_price': _round_or_none(getattr(order.executed, 'price', None), 3),
                 'value': _round_or_none(getattr(order.executed, 'value', None), 2),
                 'commission': _round_or_none(getattr(order.executed, 'comm', None), 2),
-            })
+            }
 
-        orders.sort(key=lambda item: (item.get('date') or '', item.get('ref') or 0), reverse=True)
+        orders = list(orders_by_ref.values())
+        orders.sort(key=lambda item: (item.get('date') or '9999-12-31', item.get('ref') or 0))
     except Exception as e:
         print(f"提取订单流水失败: {e}")
+        return []
     return orders
 
 

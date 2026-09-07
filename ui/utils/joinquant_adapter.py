@@ -1,6 +1,26 @@
-"""聚宽风格策略到 Backtrader Strategy 的轻量适配器。"""
+"""聚宽风格策略到 Backtrader Strategy 的完整适配器。
 
+已实现的聚宽 API:
+- order, order_target, order_value, order_target_value, order_target_percent
+- attribute_history / history
+- get_current_data
+- run_daily
+- set_benchmark, set_option, set_order_cost, set_slippage
+- log (info/warn/error/debug/set_level)
+- get_all_securities(types, date)
+- get_trade_days(start_date, end_date, count)
+- get_price(security, start/end, frequency, fields, count, panel, skip_paused, fq)
+- get_security_info(code)
+- get_security_name(code)
+- record(**kwargs)
+- is_temporarily_suspended(security)
+- normalize_code(code)
+"""
+
+import builtins
 import math
+import numpy as np
+from datetime import date as date_type, datetime, timedelta
 from types import SimpleNamespace
 
 import backtrader as bt
@@ -28,6 +48,8 @@ def create_joinquant_strategy(namespace, strategy_name='JoinQuantStrategy'):
             self._jq_logs = []
             self._jq_log_level = 'info'
             self._jq_data_map = _build_data_map(self.datas)
+            self._jq_records = []  # record() 函数的数据存储
+            self._jq_security_names = {}  # 缓存证券名称
             self._bind_api()
 
             if initialize:
@@ -70,6 +92,16 @@ def create_joinquant_strategy(namespace, strategy_name='JoinQuantStrategy'):
                 'set_slippage': api.noop,
                 'run_daily': api.run_daily,
                 'log': api.log,
+                # 新增聚宽 API
+                'get_all_securities': api.get_all_securities,
+                'get_trade_days': api.get_trade_days,
+                'get_price': api.get_price,
+                'get_security_info': api.get_security_info,
+                'get_security_name': api.get_security_name,
+                'record': api.record,
+                'is_temporarily_suspended': api.is_temporarily_suspended,
+                'normalize_code': _normalize_security,
+                'print': api.print,
             })
 
         def _update_context(self):
@@ -137,6 +169,8 @@ class _JoinQuantAPI:
     def __init__(self, strategy):
         self.strategy = strategy
 
+    # ==================== 交易 API ====================
+
     def order(self, security, amount):
         data = _resolve_data_or_none(self.strategy, security)
         if data is None or not _is_data_available(data):
@@ -166,7 +200,7 @@ class _JoinQuantAPI:
             return None
         order_value = abs(float(value))
         if value > 0:
-            order_value = min(order_value, float(self.strategy.broker.getcash()) * 0.995)
+            order_value = min(order_value, float(self.strategy.broker.getcash()) * 0.95)
         size = int(order_value / price)
         if size <= 0:
             return None
@@ -190,11 +224,9 @@ class _JoinQuantAPI:
         if target_value <= 0:
             target_size = 0
         else:
-            # JoinQuant can target nearly all available cash.  Backtrader checks
-            # commission up front, so leave a small cash buffer to avoid margin
-            # rejections on all-in ETF orders.
             portfolio_value = float(self.strategy.broker.getvalue())
-            capped_value = min(target_value, portfolio_value * 0.995)
+            cash = float(self.strategy.broker.getcash())
+            capped_value = min(target_value, portfolio_value * 0.95, cash * 0.95)
             target_size = int(capped_value / price)
 
         if target_size == current_size:
@@ -204,6 +236,8 @@ class _JoinQuantAPI:
     def order_target_percent(self, security, percent):
         value = self.strategy.broker.getvalue() * float(percent)
         return self.order_target_value(security, value)
+
+    # ==================== 定时与配置 API ====================
 
     def run_daily(self, func, time='every_bar', reference_security=None):
         if callable(func) and func not in self.strategy._jq_scheduled_funcs:
@@ -226,7 +260,9 @@ class _JoinQuantAPI:
         rows = {}
         for field in fields:
             line = getattr(data, field)
-            values = list(line.get(size=int(count)))
+            values = list(line.get(size=int(count) + 1))
+            if len(values) > int(count):
+                values = values[:-1]
             rows[field] = [float(value) for value in values]
 
         if df:
@@ -246,6 +282,388 @@ class _JoinQuantAPI:
     def log(self):
         return _Logger(self.strategy)
 
+    def print(self, *args, sep=' ', end='\n', file=None, flush=False):
+        """Capture strategy print output as dated UI logs."""
+        message = sep.join(str(arg) for arg in args)
+        _record_log(self.strategy, 'info', message, force=True)
+        if self.strategy.p.printlog:
+            builtins.print(*args, sep=sep, end=end, file=file, flush=flush)
+
+    # ==================== 新增聚宽 API ====================
+
+    def get_all_securities(self, types=None, date=None):
+        """获取证券列表
+
+        Args:
+            types: list[str] 如 ['etf'], ['stock'], ['index'] 或 None(全部)
+            date: datetime/date, 指定日期（仅影响缓存键）
+
+        Returns:
+            DataFrame, index=代码(.XSHG/.XSHE), columns=[display_name, name, start_date, end_date, type]
+        """
+        types = types or []
+        if isinstance(types, str):
+            types = [types]
+
+        # 构建缓存键
+        date_str = ''
+        if date is not None:
+            if isinstance(date, (datetime, date_type)):
+                date_str = date.strftime('%Y-%m-%d')
+            else:
+                date_str = str(date)
+        cache_key = f"securities_{'_'.join(sorted(types))}_{date_str}"
+
+        # 尝试从缓存加载
+        names_dict = getattr(self.strategy, '_jq_security_names', {})
+        result_rows = {}
+
+        # 从已加载的 data feeds 构建证券列表
+        for data in self.strategy.datas:
+            name = str(getattr(data, '_name', ''))
+            if not name:
+                continue
+            normalized = _normalize_security(name)
+            suffix = _suffix_for_code(normalized)
+            full_code = normalized + suffix
+
+            # 确定类型
+            sec_type = 'etf'
+            if normalized.startswith('000') or normalized.startswith('399'):
+                sec_type = 'index'
+            elif normalized.startswith('6') or normalized.startswith('0') or normalized.startswith('3'):
+                if not normalized.startswith('51') and not normalized.startswith('15') and not normalized.startswith('16'):
+                    sec_type = 'stock'
+
+            # 类型过滤
+            if types and sec_type not in types:
+                continue
+
+            display_name = names_dict.get(normalized, names_dict.get(full_code, name))
+            result_rows[full_code] = {
+                'display_name': display_name,
+                'name': display_name,
+                'start_date': '2000-01-01',
+                'end_date': '2200-01-01',
+                'type': sec_type,
+            }
+
+        # 如果没有从 feeds 中获取到足够数据，尝试用 akshare 补充
+        if len(result_rows) < 5 and ('etf' in types or not types):
+            try:
+                _supplement_from_akshare(result_rows, names_dict)
+            except Exception:
+                pass
+
+        # 更新名称缓存
+        for code, info in result_rows.items():
+            normalized = _normalize_security(code)
+            names_dict[normalized] = info['display_name']
+            names_dict[code] = info['display_name']
+        self.strategy._jq_security_names = names_dict
+
+        if not result_rows:
+            return pd.DataFrame(columns=['display_name', 'name', 'start_date', 'end_date', 'type'])
+
+        df = pd.DataFrame.from_dict(result_rows, orient='index')
+        df.index.name = 'code'
+        return df
+
+    def get_trade_days(self, start_date=None, end_date=None, count=None):
+        """获取交易日列表
+
+        Args:
+            start_date: 开始日期
+            end_date: 结束日期
+            count: 返回最近N个交易日
+
+        Returns:
+            list[date], 交易日列表
+        """
+        # 使用已加载数据的日期作为交易日历
+        # 这保证了回测中使用的交易日历与数据一致
+        trade_dates = []
+
+        # 从第一个数据源提取日期
+        if self.strategy.datas:
+            data = self.strategy.datas[0]
+            arrays = getattr(data, '_bt_arrays', None)
+            dates_list = getattr(data, '_bt_dates', None)
+
+            if dates_list:
+                trade_dates = list(dates_list)
+            else:
+                # 从 line buffer 提取
+                try:
+                    bar_count = len(data)
+                    for i in range(bar_count):
+                        dt = data.datetime.date(-bar_count + 1 + i)
+                        trade_dates.append(dt)
+                except Exception:
+                    pass
+
+        if not trade_dates:
+            # 尝试用 akshare 获取
+            try:
+                trade_dates = _fetch_trade_days_from_akshare()
+            except Exception:
+                # 最后兜底：生成简单日历（忽略节假日）
+                if end_date:
+                    end = end_date if isinstance(end_date, date_type) else datetime.strptime(str(end_date), '%Y-%m-%d').date()
+                else:
+                    end = self.strategy.datas[0].datetime.date(0) if self.strategy.datas else date_type.today()
+                if start_date:
+                    start = start_date if isinstance(start_date, date_type) else datetime.strptime(str(start_date), '%Y-%m-%d').date()
+                else:
+                    start = end - timedelta(days=365)
+                trade_dates = []
+                current = start
+                while current <= end:
+                    if current.weekday() < 5:  # 简单排除周末
+                        trade_dates.append(current)
+                    current += timedelta(days=1)
+                return trade_dates
+
+        # 应用过滤
+        if count is not None:
+            count = int(count)
+            if end_date:
+                end = _to_date(end_date)
+                filtered = [d for d in trade_dates if d <= end]
+                return filtered[-count:] if len(filtered) >= count else filtered
+            return trade_dates[-count:] if len(trade_dates) >= count else list(trade_dates)
+
+        if start_date or end_date:
+            start = _to_date(start_date) if start_date else None
+            end = _to_date(end_date) if end_date else None
+            filtered = trade_dates
+            if start:
+                filtered = [d for d in filtered if d >= start]
+            if end:
+                filtered = [d for d in filtered if d <= end]
+            return filtered
+
+        return trade_dates
+
+    def get_price(self, security, start_date=None, end_date=None,
+                  frequency='daily', fields=None, skip_paused=True,
+                  fq='pre', count=None, panel=True, **kwargs):
+        """获取历史行情数据
+
+        支持单标的和批量（list）查询。
+
+        Args:
+            security: str 或 list[str], 证券代码
+            start_date: 开始日期
+            end_date: 结束日期
+            frequency: 'daily' / '1d' / '1m'
+            fields: list[str] 或 str, 如 ['close', 'volume'] 或 'close'
+            count: 返回最近N条
+            panel: True=Panel格式, False=扁平DataFrame
+            skip_paused: 是否跳过停牌
+            fq: 复权方式 'pre'前复权 / 'none'不复权
+
+        Returns:
+            DataFrame 或 dict(Panel模式)
+        """
+        is_batch = isinstance(security, (list, tuple))
+        security_list = security if is_batch else [security]
+
+        if isinstance(fields, str):
+            fields = [fields]
+        default_fields = ['open', 'high', 'low', 'close', 'volume', 'money']
+        if fields is None:
+            fields = default_fields
+
+        # 确定日期范围
+        if end_date:
+            end = _to_date(end_date)
+        else:
+            end = self.strategy.datas[0].datetime.date(0) if self.strategy.datas else date_type.today()
+
+        if count is not None:
+            count = int(count)
+
+        all_dfs = {}
+        for sec in security_list:
+            df = self._get_price_single(sec, fields, end, count, frequency)
+            if df is not None and not df.empty:
+                all_dfs[sec] = df
+
+        if not is_batch:
+            # 单标的
+            code = security_list[0]
+            df = all_dfs.get(code)
+            if df is None:
+                return pd.DataFrame()
+            if panel:
+                return df
+            return df
+
+        # 批量查询
+        if not all_dfs:
+            return pd.DataFrame()
+
+        if panel:
+            # Panel 格式 (dict of DataFrames)
+            return all_dfs
+
+        # 扁平 DataFrame 格式 (panel=False)
+        frames = []
+        for code, df in all_dfs.items():
+            flat = df.copy()
+            flat.insert(0, 'code', code)
+            frames.append(flat)
+
+        if not frames:
+            return pd.DataFrame()
+
+        result = pd.concat(frames, ignore_index=False)
+        result.index.name = 'time'
+        return result
+
+    def _get_price_single(self, security, fields, end_date, count, frequency):
+        """获取单个证券的历史行情数据"""
+        data = _resolve_data_or_none(self.strategy, security)
+        if data is None:
+            return None
+
+        arrays = getattr(data, '_bt_arrays', None)
+        dates_list = getattr(data, '_bt_dates', None)
+        date_to_pos = getattr(data, '_bt_date_to_pos', None)
+
+        if arrays is None or dates_list is None or date_to_pos is None:
+            return None
+
+        # 找到 end_date 对应的位置
+        pos = date_to_pos.get(end_date)
+        if pos is None:
+            # 找最近的小于等于 end_date 的位置
+            for d, p in date_to_pos.items():
+                if d <= end_date:
+                    pos = p
+            if pos is None:
+                return None
+
+        # 确定起始位置
+        if count is not None:
+            start_pos = max(0, pos - count + 1)
+        else:
+            start_pos = 0
+
+        # 提取数据
+        close_arr = arrays.get('close', np.array([]))
+        if len(close_arr) == 0:
+            return None
+
+        actual_start = max(start_pos, 0)
+        actual_end = min(pos + 1, len(close_arr))
+
+        if actual_start >= actual_end:
+            return None
+
+        dates = dates_list[actual_start:actual_end]
+
+        rows = {}
+        if 'open' in fields and 'open' in arrays:
+            rows['open'] = arrays['open'][actual_start:actual_end]
+        if 'high' in fields and 'high' in arrays:
+            rows['high'] = arrays['high'][actual_start:actual_end]
+        if 'low' in fields and 'low' in arrays:
+            rows['low'] = arrays['low'][actual_start:actual_end]
+        if 'close' in fields and 'close' in arrays:
+            rows['close'] = arrays['close'][actual_start:actual_end]
+        if 'volume' in fields and 'volume' in arrays:
+            rows['volume'] = arrays['volume'][actual_start:actual_end]
+        if 'money' in fields:
+            # money = volume * close (聚宽的 money 是成交额)
+            vol = arrays.get('volume', np.zeros(actual_end - actual_start))
+            cls = arrays.get('close', np.zeros(actual_end - actual_start))
+            vol_slice = vol[actual_start:actual_end] if len(vol) > actual_end else vol[actual_start:]
+            cls_slice = cls[actual_start:actual_end] if len(cls) > actual_end else cls[actual_start:]
+            rows['money'] = vol_slice * cls_slice
+
+        # 确保至少有 close
+        if 'close' not in rows and 'close' in arrays:
+            rows['close'] = arrays['close'][actual_start:actual_end]
+
+        df = pd.DataFrame(rows, index=pd.DatetimeIndex(dates, name='date'))
+
+        # 跳过停牌（volume=0 或 close=NaN）
+        if skip_paused:
+            if 'volume' in df.columns:
+                df = df[df['volume'] > 0]
+            if 'close' in df.columns:
+                df = df[df['close'].notna() & (df['close'] > 0)]
+
+        return df
+
+    def get_security_info(self, code):
+        """获取证券信息
+
+        Returns:
+            SimpleNamespace(display_name, name, code, start_date, end_date, type)
+        """
+        names_dict = getattr(self.strategy, '_jq_security_names', {})
+        normalized = _normalize_security(code)
+
+        # 尝试多种键查找名称
+        display_name = (
+            names_dict.get(normalized)
+            or names_dict.get(code)
+            or names_dict.get(normalized + _suffix_for_code(normalized))
+            or code
+        )
+
+        sec_type = 'etf'
+        if normalized.startswith('000') or normalized.startswith('399'):
+            sec_type = 'index'
+
+        return SimpleNamespace(
+            display_name=display_name,
+            name=display_name,
+            code=normalized,
+            start_date=date_type(2000, 1, 1),
+            end_date=date_type(2200, 1, 1),
+            type=sec_type,
+        )
+
+    def get_security_name(self, code):
+        """获取证券名称"""
+        return self.get_security_info(code).display_name
+
+    def record(self, **kwargs):
+        """记录自定义指标值（对应聚宽的 record 函数）"""
+        current_dt = getattr(self.strategy.context, 'current_dt', None)
+        record_date = current_dt.strftime('%Y-%m-%d') if current_dt else ''
+        entry = {'date': record_date}
+        entry.update(kwargs)
+        self.strategy._jq_records.append(entry)
+
+    def is_temporarily_suspended(self, security, minute_count=10):
+        """判断证券是否盘中临时停牌
+
+        在日频回测中，通过检查当日成交量是否为0来判断。
+        """
+        data = _resolve_data_or_none(self.strategy, security)
+        if data is None:
+            return True
+        if not _is_data_available(data):
+            return True
+        # 日频回测：成交量为0视为停牌
+        try:
+            vol = float(data.volume[0])
+            if vol <= 0:
+                return True
+            close_val = _safe_line_value(data.close)
+            if close_val is None or not _is_finite_price(close_val):
+                return True
+        except Exception:
+            return True
+        return False
+
+
+# ==================== 内部辅助类 ====================
 
 class _CurrentDataProxy:
     def __init__(self, strategy):
@@ -307,6 +725,8 @@ class _Logger:
             self.strategy._jq_log_level = level
         return None
 
+
+# ==================== Portfolio 构建 ====================
 
 def _build_portfolio(strategy):
     positions = {}
@@ -410,6 +830,8 @@ class _PositionsProxy:
         return key
 
 
+# ==================== 数据解析辅助函数 ====================
+
 def _resolve_data_or_none(strategy, security):
     try:
         return _resolve_data(strategy, security)
@@ -443,11 +865,11 @@ def _remember_security_alias(strategy, security, data):
     aliases[_normalize_security(data._name)] = str(security)
 
 
-def _record_log(strategy, level, message):
+def _record_log(strategy, level, message, force=False):
     logs = getattr(strategy, '_jq_logs', None)
     if logs is None:
         return
-    if _LOG_LEVELS.get(level, 20) < _LOG_LEVELS.get(getattr(strategy, '_jq_log_level', 'info'), 20):
+    if not force and _LOG_LEVELS.get(level, 20) < _LOG_LEVELS.get(getattr(strategy, '_jq_log_level', 'info'), 20):
         return
     current_dt = getattr(getattr(strategy, 'context', None), 'current_dt', None)
     date = current_dt.strftime('%Y-%m-%d %H:%M:%S') if current_dt else ''
@@ -469,15 +891,20 @@ def _fast_attribute_history(strategy, data, count, fields, as_dataframe):
         pos = date_to_pos.get(current_date)
         if pos is None:
             return None
-        start = max(0, pos - int(count) + 1)
+        end = max(0, pos)
+        start = max(0, end - int(count))
+        if end <= start:
+            return None
         rows = {}
         for field in fields:
             values = arrays.get(field)
             if values is None:
                 return None
-            rows[field] = values[start:pos + 1].copy()
+            rows[field] = values[start:end].copy()
         if as_dataframe:
-            return pd.DataFrame(rows)
+            dates = getattr(data, '_bt_dates', [])[start:end]
+            index = pd.DatetimeIndex(dates, name='date') if dates else None
+            return pd.DataFrame(rows, index=index)
         return {field: values.tolist() for field, values in rows.items()}
     except Exception:
         return None
@@ -522,6 +949,71 @@ def _build_data_map(datas):
     return data_map
 
 
+def _suffix_for_code(code):
+    code = str(code or '')
+    return '.XSHG' if code.startswith(('5', '6', '9')) else '.XSHE'
+
+
+def _to_date(value):
+    """将各种日期格式转换为 date 对象"""
+    if isinstance(value, date_type) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    return datetime.strptime(str(value)[:10], '%Y-%m-%d').date()
+
+
+def _supplement_from_akshare(result_rows, names_dict):
+    """用 akshare 补充 ETF 证券列表"""
+    try:
+        import akshare as ak
+        df = ak.fund_etf_spot_em()
+        if df is None or df.empty:
+            return
+        for _, row in df.iterrows():
+            code = str(row.get('代码', '')).strip()
+            if not code or len(code) != 6:
+                continue
+            suffix = _suffix_for_code(code)
+            full_code = code + suffix
+            name = str(row.get('名称', code))
+            if full_code not in result_rows:
+                result_rows[full_code] = {
+                    'display_name': name,
+                    'name': name,
+                    'start_date': '2000-01-01',
+                    'end_date': '2200-01-01',
+                    'type': 'etf',
+                }
+                names_dict[code] = name
+                names_dict[full_code] = name
+    except Exception:
+        pass
+
+
+def _fetch_trade_days_from_akshare():
+    """用 akshare 获取 A 股交易日历"""
+    try:
+        import akshare as ak
+        df = ak.tool_trade_date_hist_sina()
+        if df is None or df.empty:
+            return []
+        dates = []
+        for dt in df.iloc[:, 0]:
+            if isinstance(dt, date_type):
+                dates.append(dt)
+            elif isinstance(dt, datetime):
+                dates.append(dt.date())
+            else:
+                try:
+                    dates.append(datetime.strptime(str(dt)[:10], '%Y-%m-%d').date())
+                except Exception:
+                    continue
+        return dates
+    except Exception:
+        return []
+
+
 _LOG_LEVELS = {
     'debug': 10,
     'info': 20,
@@ -529,8 +1021,3 @@ _LOG_LEVELS = {
     'warning': 30,
     'error': 40,
 }
-
-
-def _suffix_for_code(code):
-    code = str(code or '')
-    return '.XSHG' if code.startswith(('5', '6', '9')) else '.XSHE'

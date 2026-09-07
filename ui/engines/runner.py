@@ -7,7 +7,6 @@
 
 import contextlib
 import io
-import os
 import time
 import uuid
 import threading
@@ -24,6 +23,7 @@ _BENCHMARK_PROXY = {
     '000016': '510050',
     '000905': '510500',
 }
+_DEFAULT_WARMUP_CALENDAR_DAYS = 260
 
 
 class PandasDataFeed(bt.feeds.PandasData):
@@ -74,27 +74,37 @@ def run_backtest(strategy_class, strategy_params, config, progress_callback=None
     if preferred_data_codes:
         data_codes = _merge_codes(preferred_data_codes, data_codes)
 
-    # 日期格式转换
+    # 日期格式转换。聚宽 attribute_history 可以读取回测开始日前的历史，
+    # 因此本地也预取一段历史，仅用于指标/排名计算，不进入回测绩效区间。
     start_str = start_date.replace('-', '')
     end_str = end_date.replace('-', '')
+    warmup_start_str = _warmup_start_str(start_date, config)
+    warmup_start_date = _yyyy_mm_dd(warmup_start_str)
 
     # 1. 并发下载数据
-    data_feeds = _download_data_feeds(
-        data_codes, start_str, end_str, data_type, progress_callback)
+    raw_data_feeds = _download_data_feeds(
+        data_codes, warmup_start_str, end_str, data_type, progress_callback)
 
-    if not data_feeds:
+    if not raw_data_feeds:
         raise ValueError("无法下载任何数据，请检查代码和日期范围")
 
     # 2. 下载基准数据
-    benchmark_df = download_data(benchmark_code, start_str, end_str, data_type='index')
+    raw_benchmark_df = download_data(benchmark_code, warmup_start_str, end_str, data_type='index')
     benchmark_name = benchmark_code
     benchmark_source = 'index'
 
-    if benchmark_df is None or len(benchmark_df) <= 20:
+    if raw_benchmark_df is None or len(raw_benchmark_df) <= 20:
         proxy_code = _BENCHMARK_PROXY.get(benchmark_code)
-        if proxy_code and proxy_code in data_feeds:
-            benchmark_df = data_feeds[proxy_code]
+        if proxy_code and proxy_code in raw_data_feeds:
+            raw_benchmark_df = raw_data_feeds[proxy_code]
             benchmark_source = f'proxy:{proxy_code}'
+
+    data_feeds, benchmark_df = _align_to_master_calendar(
+        raw_data_feeds, raw_benchmark_df, start_date, end_date)
+    history_data_feeds, history_benchmark_df = _align_to_master_calendar(
+        raw_data_feeds, raw_benchmark_df, warmup_start_date, end_date)
+    data_coverage = _build_data_coverage(data_feeds)
+    history_data_coverage = _build_data_coverage(history_data_feeds)
 
     if progress_callback:
         progress_callback(
@@ -104,10 +114,6 @@ def run_backtest(strategy_class, strategy_params, config, progress_callback=None
             '行情和基准已加载，正在运行回测',
         )
 
-    data_coverage = _build_data_coverage(data_feeds)
-    data_feeds, benchmark_df = _align_to_master_calendar(
-        data_feeds, benchmark_df, start_date, end_date)
-
     benchmark_progress = _benchmark_progress_series(benchmark_df)
 
     # 3. 创建 Cerebro
@@ -116,13 +122,13 @@ def run_backtest(strategy_class, strategy_params, config, progress_callback=None
     # 添加数据源
     for code, df in data_feeds.items():
         feed = PandasDataFeed(dataname=df, name=code)
-        _attach_fast_history(feed, df)
+        _attach_fast_history(feed, history_data_feeds.get(code, df))
         cerebro.adddata(feed, name=code)
 
     # 添加基准数据（作为额外数据源，不影响策略逻辑）
     if benchmark_df is not None and len(benchmark_df) > 20:
         benchmark_feed = PandasDataFeed(dataname=benchmark_df, name=benchmark_code)
-        _attach_fast_history(benchmark_feed, benchmark_df)
+        _attach_fast_history(benchmark_feed, history_benchmark_df)
         cerebro.adddata(benchmark_feed, name=benchmark_code)
 
     # 添加策略
@@ -177,7 +183,9 @@ def run_backtest(strategy_class, strategy_params, config, progress_callback=None
     result['requested_data_codes'] = requested_data_codes
     result['requested_start_date'] = start_date
     result['requested_end_date'] = end_date
+    result['warmup_start_date'] = warmup_start_date
     result['data_coverage'] = data_coverage
+    result['history_data_coverage'] = history_data_coverage
     result['logs'] = _merge_logs(
         getattr(strat, '_jq_logs', []),
         stdout.getvalue(),
@@ -229,6 +237,21 @@ def _download_data_feeds(data_codes, start_str, end_str, data_type, progress_cal
         for code in data_codes
         if code in data_feeds
     }
+
+
+def _warmup_start_str(start_date, config):
+    days = config.get('warmup_calendar_days', config.get('warmup_days'))
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        days = _DEFAULT_WARMUP_CALENDAR_DAYS
+    days = max(0, min(days, 1200))
+    start = pd.to_datetime(start_date) - pd.Timedelta(days=days)
+    return start.strftime('%Y%m%d')
+
+
+def _yyyy_mm_dd(yyyymmdd):
+    return pd.to_datetime(yyyymmdd).strftime('%Y-%m-%d')
 
 
 class _RealtimeProgressAnalyzer(bt.Analyzer):
@@ -474,13 +497,18 @@ def _build_data_coverage(data_feeds):
     coverage = []
     for code, df in data_feeds.items():
         if df is None or df.empty:
-            coverage.append({'code': code, 'start': '', 'end': '', 'rows': 0})
+            coverage.append({'code': code, 'start': '', 'end': '', 'rows': 0, 'valid_rows': 0})
             continue
+        valid = pd.Series(dtype='float64')
+        if 'close' in df:
+            valid = pd.to_numeric(df['close'], errors='coerce')
+            valid = valid[valid.notna() & (valid > 0)]
         coverage.append({
             'code': code,
-            'start': df.index[0].strftime('%Y-%m-%d'),
-            'end': df.index[-1].strftime('%Y-%m-%d'),
+            'start': valid.index[0].strftime('%Y-%m-%d') if not valid.empty else '',
+            'end': valid.index[-1].strftime('%Y-%m-%d') if not valid.empty else '',
             'rows': len(df),
+            'valid_rows': len(valid),
         })
     return coverage
 

@@ -190,6 +190,14 @@ def execute_strategy_code(source_code, filename='<uploaded>', strategy_format='a
         'attribute_history': _noop,
         'history': _noop,
         'get_current_data': _noop,
+        'get_all_securities': _noop,
+        'get_trade_days': _noop,
+        'get_price': _noop,
+        'get_security_info': _noop,
+        'get_security_name': _noop,
+        'record': _noop,
+        'is_temporarily_suspended': lambda *a, **k: False,
+        'normalize_code': lambda code: str(code).split('.')[0] if code else '',
         'log': _UploadLogger(),
     }
 

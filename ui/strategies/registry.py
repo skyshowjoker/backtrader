@@ -80,24 +80,14 @@ class StrategyRegistry:
 
     @classmethod
     def get_dropdown_options(cls):
-        """获取 Dash Dropdown 选项格式"""
+        """获取策略选项列表（通用格式，供 API /meta 使用）"""
         options = []
-        # 内置策略
-        builtin = [k for k, v in cls._strategies.items() if v['category'] == 'builtin']
-        if builtin:
-            options.append({'label': '── 内置策略 ──', 'value': '', 'disabled': True})
-            for name in builtin:
-                desc = cls._strategies[name]['description']
-                label = f"{name}" + (f" - {desc[:20]}" if desc else '')
-                options.append({'label': label, 'value': name})
-
-        # 自定义策略
-        custom = [k for k, v in cls._strategies.items() if v['category'] == 'custom']
-        if custom:
-            options.append({'label': '── 自定义策略 ──', 'value': '', 'disabled': True})
-            for name in custom:
-                options.append({'label': f"📎 {name}", 'value': name})
-
+        for name, info in cls._strategies.items():
+            options.append({
+                'name': name,
+                'description': info.get('description', ''),
+                'category': info.get('category', 'builtin'),
+            })
         return options
 
     @classmethod

@@ -17,15 +17,14 @@ from ui.engines.data_fetcher import BENCHMARK_POOL, ETF_POOL, download_data
 from ui.engines.runner import check_result, start_backtest
 from ui.strategies.registry import StrategyRegistry
 from ui.strategies.sma_cross import SMACrossStrategy
+from ui.utils import db
 from ui.utils.sandbox import execute_strategy_code, validate_strategy_code
-
-_TASK_HISTORY = {}
-_MAX_TASK_HISTORY = 50
 
 
 def create_app():
     """Create the API app and register built-in strategies."""
     _register_default_strategies()
+    db.init_db()
 
     app = Flask(__name__)
 
@@ -61,14 +60,13 @@ def create_app():
 
     @app.route('/api/backtests', methods=['GET'])
     def list_backtests():
-        for task_id in list(_TASK_HISTORY):
-            _sync_task_meta(task_id)
-        tasks = sorted(
-            _TASK_HISTORY.values(),
-            key=lambda item: item.get('created_at', ''),
-            reverse=True,
-        )
-        return jsonify({'tasks': tasks})
+        rows = db.list_backtests(limit=50)
+        # 合并运行中的任务
+        for task_id in list(_running_tasks):
+            result = check_result(task_id)
+            _sync_running_to_db(task_id, result)
+        rows = db.list_backtests(limit=50)
+        return jsonify({'tasks': rows})
 
     @app.route('/api/backtests', methods=['POST', 'OPTIONS'])
     def create_backtest():
@@ -117,18 +115,29 @@ def create_app():
         except Exception as exc:
             return _api_error(f'启动失败: {exc}', 500)
 
-        _TASK_HISTORY[task_id] = {
+        now_iso = _now_iso()
+        summary = {}
+
+        # 保存到数据库
+        db.save_backtest(
+            task_id=task_id,
+            strategy=strategy_name,
+            params=params,
+            config=config,
+            status='running',
+            message='准备加载行情数据',
+            summary=summary,
+            result_data=None,
+            created_at=now_iso,
+            updated_at=now_iso,
+        )
+
+        # 追踪运行中的任务
+        _running_tasks[task_id] = {
             'task_id': task_id,
             'strategy': strategy_name,
-            'params': params,
-            'config': config,
-            'status': 'running',
-            'message': '准备加载行情数据',
-            'created_at': _now_iso(),
-            'updated_at': _now_iso(),
-            'summary': {},
+            'started_at': time.time(),
         }
-        _trim_task_history()
 
         return jsonify({'task_id': task_id, 'status': 'running'})
 
@@ -136,10 +145,33 @@ def create_app():
     def get_backtest(task_id):
         result = check_result(task_id)
         status = result.get('status')
+
         if status == 'unknown':
+            # 尝试从数据库加载已完成的结果
+            db_row = db.load_backtest(task_id)
+            if db_row:
+                db_row['data'] = db_row.pop('result_data', None)
+                return jsonify(db_row)
             return _api_error('未找到回测任务', 404)
-        _sync_task_meta(task_id, result)
-        return jsonify(result)
+
+        _sync_running_to_db(task_id, result)
+
+        # 构造返回格式
+        response = {'task_id': task_id, 'status': result.get('status')}
+        data = result.get('data')
+        if isinstance(data, dict):
+            response['data'] = data
+            metrics = data.get('metrics') or {}
+            response['message'] = result.get('message', '')
+            response['progress'] = result.get('progress', {})
+        elif result.get('status') == 'error':
+            response['data'] = data
+            response['message'] = '回测失败'
+        else:
+            response['message'] = result.get('message', '')
+            response['progress'] = result.get('progress', {})
+
+        return jsonify(response)
 
     @app.route('/api/market/series', methods=['GET', 'POST', 'OPTIONS'])
     def market_series():
@@ -265,6 +297,72 @@ def create_app():
 
     return app
 
+
+# ==================== 运行中任务追踪 ====================
+
+import time as time
+
+_running_tasks = {}  # task_id -> {strategy, started_at}
+
+
+def _sync_running_to_db(task_id, result=None):
+    """将运行中任务的状态同步到数据库"""
+    if task_id not in _running_tasks:
+        return
+
+    result = result or check_result(task_id)
+    status = result.get('status')
+    meta = _running_tasks.get(task_id, {})
+    strategy = meta.get('strategy', '')
+
+    if status in ('done', 'error'):
+        # 回测完成，写入完整结果到数据库
+        now_iso = _now_iso()
+        data = result.get('data')
+        summary = {}
+
+        if isinstance(data, dict):
+            metrics = data.get('metrics') or {}
+            summary = {
+                'total_return': metrics.get('total_return'),
+                'annual_return': metrics.get('annual_return'),
+                'max_drawdown': metrics.get('max_drawdown'),
+                'sharpe_ratio': metrics.get('sharpe_ratio'),
+                'signals': len(data.get('signals') or []),
+                'trades': len(data.get('trades') or []),
+                'orders': len(data.get('orders') or []),
+                'positions': len(data.get('positions') or []),
+                'logs': len(data.get('logs') or []),
+                'final_value': data.get('final_value'),
+            }
+        elif status == 'error':
+            summary = {'error': str(data)}
+
+        db.save_backtest(
+            task_id=task_id,
+            strategy=strategy,
+            params=None,
+            config=None,
+            status=status,
+            message=result.get('message', ''),
+            summary=summary,
+            result_data=data if isinstance(data, dict) else None,
+            created_at=None,
+            updated_at=now_iso,
+        )
+
+        if status == 'done':
+            _running_tasks.pop(task_id, None)
+    else:
+        # 运行中，只更新状态
+        db.update_backtest_status(
+            task_id, status='running',
+            message=result.get('message', ''),
+            updated_at=_now_iso(),
+        )
+
+
+# ==================== Helpers ====================
 
 def _register_default_strategies():
     """Register built-in strategies for API-only runs."""
@@ -448,48 +546,6 @@ def _parse_non_negative_float(value, default, label):
 
 def _now_iso():
     return datetime.now().isoformat(timespec='seconds')
-
-
-def _sync_task_meta(task_id, result=None):
-    """Keep API task history aligned with the runner store."""
-    if task_id not in _TASK_HISTORY:
-        return
-
-    result = result or check_result(task_id)
-    meta = _TASK_HISTORY[task_id]
-    meta['status'] = result.get('status', meta.get('status'))
-    meta['message'] = result.get('message', meta.get('message', ''))
-    meta['updated_at'] = _now_iso()
-
-    data = result.get('data')
-    if isinstance(data, dict):
-        metrics = data.get('metrics') or {}
-        meta['summary'] = {
-            'total_return': metrics.get('total_return'),
-            'annual_return': metrics.get('annual_return'),
-            'max_drawdown': metrics.get('max_drawdown'),
-            'sharpe_ratio': metrics.get('sharpe_ratio'),
-            'signals': len(data.get('signals') or []),
-            'trades': len(data.get('trades') or []),
-            'orders': len(data.get('orders') or []),
-            'positions': len(data.get('positions') or []),
-            'logs': len(data.get('logs') or []),
-            'final_value': data.get('final_value'),
-        }
-    elif result.get('status') == 'error':
-        meta['summary'] = {'error': data}
-
-
-def _trim_task_history():
-    if len(_TASK_HISTORY) <= _MAX_TASK_HISTORY:
-        return
-
-    removable = sorted(
-        _TASK_HISTORY.items(),
-        key=lambda item: item[1].get('created_at', ''),
-    )
-    for task_id, _ in removable[:len(_TASK_HISTORY) - _MAX_TASK_HISTORY]:
-        _TASK_HISTORY.pop(task_id, None)
 
 
 def _api_error(message, status):
